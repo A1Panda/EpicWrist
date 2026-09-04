@@ -1,0 +1,56 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\A1_Pa\\.ohos\\config\\default_EpicWrist_1rHMXyiymOv3xXadkg62Oz0PDkRUUBRp6QjmphN8pN0=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001AD316A1EA05E46182520191ADFCECA70D202AB9A12629FF94559494885FA3991DF35443B4421B",
+          "profile": "C:\\Users\\A1_Pa\\.ohos\\config\\default_EpicWrist_1rHMXyiymOv3xXadkg62Oz0PDkRUUBRp6QjmphN8pN0=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\A1_Pa\\.ohos\\config\\default_EpicWrist_1rHMXyiymOv3xXadkg62Oz0PDkRUUBRp6QjmphN8pN0=.p12",
+          "storePassword": "0000001A3573DCF6102942750997BC5ED3D3F7FC58D41EBE8E97323F862C314F57686952DB96D039C3AB"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "targetSdkVersion": "6.1.1(24)",
+        "compatibleSdkVersion": "6.1.1(24)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}
