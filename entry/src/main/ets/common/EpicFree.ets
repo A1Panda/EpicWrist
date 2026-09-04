@@ -7,6 +7,7 @@ import { http } from '@kit.NetworkKit';
 import { preferences } from '@kit.ArkData';
 import { notificationManager } from '@kit.NotificationKit';
 import { common } from '@kit.AbilityKit';
+import { calendarManager } from '@kit.CalendarKit';
 
 // ================= 常量 =================
 
@@ -29,6 +30,8 @@ export const CLAIM_MODE_KEY: string = 'claimAuto';  // 领取方式：true=自�
 export const GRIP_KEY: string = 'gripAdapt';        // 智感握持开关：true=按钮跟随握持手换角
 export const FAB_RIGHT_KEY: string = 'fabSideRight'; // 智感握持关闭时手动固定按钮：true=右下角 false=左下角
 export const CLAIMED_KEY: string = 'claimedTitles'; // 自动领取已成功入库的游戏标题
+export const CAL_KEY: string = 'calOn';             // “自动把即将免费加入日历”开关
+export const CAL_DONE_KEY: string = 'calDone';      // 已写入系统日历的 “标题|开领日期” 数组（去重用）
 
 // EPIC 登录/领取页地址（自动领取=内置网页模拟用户点“获取”，需保持 EPIC 登录态）
 export const CLAIM_LOGIN_URL: string = 'https://accounts.epicgames.com/login';
@@ -45,13 +48,14 @@ export const CHECK_CYCLE_MS: number = 12 * 60 * 60 * 1000;
 // ================= 数据模型 =================
 
 // 列表条目：title=游戏名，sub=副标题，img=封面图 URL，claim=官方领取页 URL（空则不可领取），
-// startMs=（即将免费按此排序）
+// startMs=（即将免费按此排序）开领时刻，endMs=该期免费截止时刻（可选，历史记录用）
 export interface GameItem {
   title: string;
   sub: string;
   img: string;
   claim: string;
   startMs: number;
+  endMs?: number;
 }
 
 export interface FreeLists {
@@ -292,7 +296,8 @@ export function parseFree(text: string): FreeLists | null {
             sub: '免费至 ' + fmtMdHm(Date.parse(cur.endDate)),
             img: pickGameImage(el.keyImages),
             claim: claimUrlOf(el),
-            startMs: nowMs
+            startMs: nowMs,
+            endMs: Date.parse(cur.endDate)
           };
           nowArr.push(item);
         }
@@ -520,4 +525,146 @@ export async function publishFreeNotice(titles: string[], requestPermission: boo
     }
   };
   await notificationManager.publish(req);
+}
+
+// ================= 系统日历：把“即将免费”自动写成全天日程 =================
+// 开关开启后：每次拉到“即将免费”列表，就为还没写过的游戏在“开领当天”建一条
+// 全天日程；重复刷新按 “标题|开领日期” 去重，不会反复建日程。
+
+// 本应用自建的本地日历账号名（首次写入时创建，之后按账号复用）
+const CAL_ACCOUNT_NAME: string = 'epic_free_cal';
+
+// 毫秒时刻所在“当天 00:00”（本地时区，全天日程的开始点）
+export function dayStartMs(ms: number): number {
+  const d = new Date(ms);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+// 毫秒时刻所在“当天 23:59:59”（本地时区，全天日程的结束点）
+export function dayEndMs(ms: number): number {
+  const d = new Date(ms);
+  d.setHours(23, 59, 59, 0);
+  return d.getTime();
+}
+
+// 日期键：同一游戏不同周的免费档不会互相去重
+function dayKey(ms: number): string {
+  const d = new Date(ms);
+  return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+}
+
+// 开领时刻中文文案（M月d日 HH:mm），写进日程描述便于看精确时间
+function fmtFreeAt(ms: number): string {
+  const d = new Date(ms);
+  return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+}
+
+// 读取“自动把即将免费加入日历”开关偏好
+export async function readCalOn(context: common.Context): Promise<boolean> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    const v = p.getSync(CAL_KEY, false);
+    return v === true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// 写入“自动把即将免费加入日历”开关偏好
+export async function saveCalOn(context: common.Context, on: boolean): Promise<void> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    p.putSync(CAL_KEY, on);
+    await p.flush();
+  } catch (e) {
+    // 存档失败不阻断主流程
+  }
+}
+
+// 读取“已写入日程”键数组（异常时返回空数组）
+async function readCalDone(context: common.Context): Promise<string[]> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    const raw = p.getSync(CAL_DONE_KEY, '[]') as string;
+    const arr = JSON.parse(raw) as string[];
+    return arr instanceof Array ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+// 覆盖写入“已写入日程”键数组
+async function saveCalDone(context: common.Context, list: string[]): Promise<void> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    p.putSync(CAL_DONE_KEY, JSON.stringify(list));
+    await p.flush();
+  } catch (e) {
+    // 存档失败不阻断主流程
+  }
+}
+
+// 把“即将免费”的开领日批量写成全天日程，返回本次实际新写入的条数。
+// 需要已授权 ohos.permission.WRITE_CALENDAR / READ_CALENDAR，无权限或失败静默返回 0。
+export async function addFreeToCalendar(context: common.Context, items: GameItem[]): Promise<number> {
+  if (items.length === 0) {
+    return 0;
+  }
+  let added: number = 0;
+  try {
+    const manager = calendarManager.getCalendarManager(context);
+    const account: calendarManager.CalendarAccount = {
+      name: CAL_ACCOUNT_NAME,
+      type: calendarManager.CalendarType.LOCAL,
+      displayName: 'EPIC喜加一'
+    };
+    // 复用本应用自建的本地日历；不存在（首次/被用户删除）时新建一个
+    let cal: calendarManager.Calendar | null = null;
+    try {
+      cal = await manager.getCalendar(account);
+    } catch (e) {
+      cal = await manager.createCalendar(account);
+    }
+    if (cal === null) {
+      return 0;
+    }
+    try {
+      await cal.setConfig({ enableReminder: true });
+    } catch (e) {
+      // 配置失败不影响写日程
+    }
+    const done: string[] = await readCalDone(context);
+    for (let i = 0; i < items.length; i++) {
+      const it: GameItem = items[i];
+      const key: string = it.title + '|' + dayKey(it.startMs);
+      if (done.indexOf(key) >= 0) {
+        continue;
+      }
+      const ev: calendarManager.Event = {
+        type: calendarManager.EventType.NORMAL,
+        title: 'EPIC免费开领：《' + it.title + '》',
+        startTime: dayStartMs(it.startMs),
+        endTime: dayEndMs(it.startMs),
+        isAllDay: true,
+        // 全天日程的提醒锚定在当天（[0] 即当天上午提醒）；精确开领时刻写入描述
+        reminderTime: [0],
+        description: '该游戏将于 ' + fmtFreeAt(it.startMs) +
+          ' 在 EPIC 商店免费开领，打开 EPIC喜加一 可一键领取'
+      };
+      try {
+        await cal.addEvent(ev);
+        done.push(key);
+        added++;
+      } catch (e) {
+        // 单条失败不阻塞其余游戏
+      }
+    }
+    if (added > 0) {
+      await saveCalDone(context, done);
+    }
+  } catch (e) {
+    added = 0;
+  }
+  return added;
 }

@@ -1,4 +1,4 @@
-import { common } from '@kit.AbilityKit';
+import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit';
 import { promptAction, router } from '@kit.ArkUI';
 import { notificationManager } from '@kit.NotificationKit';
 import { workScheduler } from '@kit.BackgroundTasksKit';
@@ -25,8 +25,12 @@ import {
   readClaimed,
   freshTitles,
   mergeSeen,
-  publishFreeNotice
+  publishFreeNotice,
+  readCalOn,
+  saveCalOn,
+  addFreeToCalendar
 } from '../common/EpicFree';
+import { HistItem, recordFreeNow, readHistoryMerged, backfillHistCovers } from '../common/FreeHistory';
 
 // ================= 配色（参考 HarmonyOS 系统应用：黑底 + 深灰卡片 + 系统蓝） =================
 
@@ -37,6 +41,44 @@ const COLOR_TEXT: string = '#FFFFFF';
 const COLOR_SUB: string = '#8E8E93';
 const COLOR_LINE: string = '#2C2C2E';
 const COLOR_ACCENT: string = '#0A59F7';
+const COLOR_OK: string = '#34C759';
+// 历史页“滑动加载更多”：首次只渲染一页，滑到底部再按此数量追加（避免上千条一次性全部渲染）
+const HIST_PAGE: number = 20;
+
+// ================= 历史“按月分组” =================
+// 历史列表按开领时刻倒序，天然按“年-月”连续成段；这里负责分组的键/标题，
+// 以及把“可见窗口终点”对齐到整月末尾——保证追加加载时不会把某个月份切成两半重复显示标题。
+
+// 历史分组的展示结构：label=月份标题（如 2026年9月），items=该月卡片（保持倒序）
+interface HistGroup {
+  label: string;
+  items: HistItem[];
+}
+
+// 分组键：形如 “2026-9”
+function histMonthKey(h: HistItem): string {
+  const d: Date = new Date(h.startMs);
+  return d.getFullYear() + '-' + (d.getMonth() + 1);
+}
+
+// 月份标题：形如 “2026年9月”
+function histMonthLabel(h: HistItem): string {
+  const d: Date = new Date(h.startMs);
+  return d.getFullYear() + '年' + (d.getMonth() + 1) + '月';
+}
+
+// 把可见条数 target 终点扩展到其所在月份的末尾；target 已是总数则原样返回。
+function histAlignMonthEnd(list: HistItem[], target: number): number {
+  if (target >= list.length) {
+    return list.length;
+  }
+  const key: string = histMonthKey(list[target - 1]);
+  let end: number = target;
+  while (end < list.length && histMonthKey(list[end]) === key) {
+    end++;
+  }
+  return end;
+}
 
 // ================= 页面 =================
 
@@ -47,7 +89,14 @@ struct Index {
   @State failed: boolean = false;
   @State nowList: GameItem[] = [];
   @State soonList: GameItem[] = [];
+  // EPIC 送过的免费游戏历史（本地累积 + 第三方补全，最新在前）
+  @State histList: HistItem[] = [];
+  // 历史页实际渲染的可见子集：始终只保留前若干条，滑到底部再追加（数据总条数见 histList）
+  @State histShown: HistItem[] = [];
   @State notifyOn: boolean = false;
+  // 自动把“即将免费”加入系统日历：true=拉到新档期就写全天日程并提醒
+  @State calOn: boolean = false;
+  private calSyncing: boolean = false;
   // 领取方式：false=跳转领取（点卡片用系统浏览器打开） true=自动领取（点悬浮按钮批量代领）
   @State claimAuto: boolean = false;
   // 已自动领取成功入库的游戏标题（卡片据此显示“已领取”并跳过重复尝试）
@@ -66,6 +115,8 @@ struct Index {
   private lastLoad: number = 0;
   private seenFree: string[] = [];
   private prefReady: boolean = false;
+  // 历史页补图是否进行中（只对可见窗口补、单飞，避免并发重复请求）
+  private histFillBusy: boolean = false;
 
   aboutToAppear(): void {
     // 握持手监听在 initState 读完好偏好后再按开关决定是否开启
@@ -124,6 +175,8 @@ struct Index {
       if (on) {
         this.startBgWork();
       }
+      const cal: boolean = await readCalOn(ctx);
+      this.calOn = cal;
       const auto: boolean = await readClaimAuto(ctx);
       this.claimAuto = auto;
       const grip: boolean = await readGripAdapt(ctx);
@@ -132,6 +185,10 @@ struct Index {
       this.manualRight = right;
       const claimed: string[] = await readClaimed(ctx);
       this.claimedTitles = claimed;
+      const hist: HistItem[] = await readHistoryMerged(ctx);
+      this.histList = hist;
+      // 首次只展示约一页（终点对齐到整月，月份标题不会被截断），其余滑动到底部按需追加
+      this.histShown = hist.slice(0, histAlignMonthEnd(hist, Math.min(HIST_PAGE, hist.length)));
     } catch (e) {
     }
     this.prefReady = true;
@@ -155,6 +212,7 @@ struct Index {
     }
     // 从领取页/浏览器返回时刷新“已领取”名单，让卡片状态同步
     this.refreshClaimed();
+    this.loadHistory();
     if (Date.now() - this.lastLoad > REFRESH_GAP_MS) {
       this.load();
     }
@@ -195,6 +253,12 @@ struct Index {
     this.nowList = nowArr;
     this.soonList = soonArr;
     this.lastLoad = Date.now();
+    // 历史页数据：把本批“现在免费”并入本地历史（已记录过会自动跳过）
+    this.recordFreeHistory(nowArr);
+    // 自动加入日历开启时：新拉到的“即将免费”顺手写成开领当天的全天日程
+    if (this.calOn) {
+      this.syncCalToCalendar(true);
+    }
   }
 
   checkNewFree(nowArr: GameItem[]): void {
@@ -290,6 +354,184 @@ struct Index {
       this.claimedTitles = list;
     }).catch(() => {
     });
+  }
+
+  // ================= 历史：EPIC 送过的免费游戏 =================
+
+  // 重新读取历史（进入页面/返回前台时调用）：
+  // 内容没变化时不动已渲染窗口、保留滚动位置；有变化才整体刷新，并只渲染首页条数。
+  private loadHistory(): void {
+    const ctx = getContext(this) as common.Context;
+    readHistoryMerged(ctx).then((list: HistItem[]) => {
+      if (this.sameHist(this.histList, list)) {
+        return;
+      }
+      this.histList = list;
+      // 有变化才整体刷新；同样只展示约一页、终点对齐整月
+      this.histShown = list.slice(0, histAlignMonthEnd(list, Math.min(HIST_PAGE, list.length)));
+      this.fillVisibleHistCovers();
+    }).catch(() => {
+    });
+  }
+
+  // 两个历史数组内容是否一致（只比较长度与首尾项，避免回前台时把列表重置到顶部造成跳动）
+  private sameHist(a: HistItem[], b: HistItem[]): boolean {
+    if (a.length !== b.length) {
+      return false;
+    }
+    if (a.length === 0) {
+      return true;
+    }
+    const ha: HistItem = a[0];
+    const hb: HistItem = b[0];
+    const ta: HistItem = a[a.length - 1];
+    const tb: HistItem = b[b.length - 1];
+    return ha.t === hb.t && ha.startMs === hb.startMs &&
+      ta.t === tb.t && ta.startMs === tb.startMs;
+  }
+
+  // 滑到历史列表底部：再追加约一页（终点对齐整月，不会把某月切成两段重复标题；
+  // 数据总量见 histList，展示窗口见 histShown）
+  private loadMoreHistory(): void {
+    if (this.histShown.length >= this.histList.length) {
+      return;
+    }
+    const target: number = Math.min(this.histList.length, this.histShown.length + HIST_PAGE);
+    this.histShown = this.histList.slice(0, histAlignMonthEnd(this.histList, target));
+    // 窗口变大了：顺手给新进入可见范围的缺图条目补封面
+    this.fillVisibleHistCovers();
+  }
+
+  // 给历史页“当前可见窗口”里没有封面的条目做运行时两级补图
+  // （Steam 商店搜索 → EPIC 兜底，结果进缓存；见 FreeHistory.backfillHistCovers）。
+  // 只在进入历史页 / 上滑加载更多时触发；一次进行中则跳过，避免并发重复请求；
+  // 补齐后若确有条目变化才重建列表，保持滚动位置与按月分组稳定。
+  private fillVisibleHistCovers(): void {
+    if (this.histFillBusy) {
+      return;
+    }
+    if (this.curTab !== 1 || this.histShown.length === 0 || this.histList.length === 0) {
+      return;
+    }
+    const base: HistItem[] = this.histList;
+    const limit: number = this.histShown.length;
+    this.histFillBusy = true;
+    const ctx = getContext(this) as common.Context;
+    backfillHistCovers(ctx, base, limit).then((list: HistItem[]) => {
+      // 等待期间历史被整体重新加载过则放弃本次结果（新列表已自带缓存封面）
+      if (this.histList !== base) {
+        return;
+      }
+      // 只比较可见窗口：对象引用变了才认为有封面补齐
+      let changed: boolean = false;
+      if (list.length === base.length) {
+        for (let i = 0; i < limit; i++) {
+          if (list[i] !== base[i]) {
+            changed = true;
+            break;
+          }
+        }
+      }
+      if (changed) {
+        this.histList = list;
+        this.histShown = list.slice(0, limit);
+      }
+    }).catch(() => {
+    }).then(() => {
+      this.histFillBusy = false;
+    });
+  }
+
+  // 底部导航切换：进入历史页时给可见窗口补一次封面
+  private switchTab(index: number): void {
+    this.curTab = index;
+    if (index === 1) {
+      this.fillVisibleHistCovers();
+    }
+  }
+
+  // 把 histShown 按“年月”聚合成展示分组（histShown 的终点始终对齐整月，
+  // 因此同一月份的所有条目必然在同一个分组里，不会出现半个月份标题）
+  private histGroups(): HistGroup[] {
+    const groups: HistGroup[] = [];
+    let lastKey: string = '';
+    let cur: HistGroup = { label: '', items: [] };
+    for (let i = 0; i < this.histShown.length; i++) {
+      const it: HistItem = this.histShown[i];
+      const key: string = histMonthKey(it);
+      if (groups.length === 0 || key !== lastKey) {
+        cur = { label: histMonthLabel(it), items: [] };
+        groups.push(cur);
+        lastKey = key;
+      }
+      cur.items.push(it);
+    }
+    return groups;
+  }
+
+  // 把本批“现在免费”并入本地历史，随后刷新页面数据（静默，失败不影响主流程）
+  private recordFreeHistory(nowArr: GameItem[]): void {
+    if (nowArr.length === 0) {
+      return;
+    }
+    const ctx = getContext(this) as common.Context;
+    recordFreeNow(ctx, nowArr).then((added: number) => {
+      if (added > 0) {
+        this.loadHistory();
+      }
+    }).catch(() => {
+    });
+  }
+
+  // 历史条目状态文案（已领取 > 仍在免费 > 已结束）
+  private histStatus(h: HistItem): string {
+    if (this.isClaimed(h.t)) {
+      return '已领取';
+    }
+    if (h.endMs > Date.now()) {
+      return '免费中';
+    }
+    return '已结束';
+  }
+
+  // 历史条目状态颜色
+  private histColor(h: HistItem): string {
+    if (this.isClaimed(h.t)) {
+      return COLOR_OK;
+    }
+    if (h.endMs > Date.now()) {
+      return COLOR_ACCENT;
+    }
+    return COLOR_SUB;
+  }
+
+  // 历史条目展示区间：同一年只显 M月d日，跨年份前缀年份避免歧义
+  private histRange(h: HistItem): string {
+    const s = new Date(h.startMs);
+    const e = new Date(h.endMs);
+    const head: string = s.getFullYear() !== new Date().getFullYear() ?
+      s.getFullYear() + '年' : '';
+    return head + (s.getMonth() + 1) + '月' + s.getDate() + '日 – ' +
+      (e.getMonth() + 1) + '月' + e.getDate() + '日';
+  }
+
+  // 点击历史卡片：已领取→重新进入官方游戏页浏览；未领取且仍在免费→走领取流程；其余跳官方页面
+  private tapHist(h: HistItem): void {
+    if (h.url.length === 0) {
+      promptAction.showToast({ message: '暂无可用的游戏页面' });
+      return;
+    }
+    if (this.isClaimed(h.t)) {
+      this.openBrowser(h.url);
+      return;
+    }
+    if (h.endMs > Date.now() && this.claimAuto) {
+      // 还在免费期且处于自动领取模式：直接交给自动领取会话
+      const one: ClaimTask = { t: h.t, url: h.url };
+      this.pushClaimSession([one]);
+      return;
+    }
+    this.openBrowser(h.url);
   }
 
   // 收集“现在免费”中尚未领取成功的游戏，作为批量领取任务
@@ -441,6 +683,74 @@ struct Index {
     }
   }
 
+  // ================= 自动加入系统日历 =================
+
+  // 请求日历读写权限；全部授权才算成功（用户拒绝则保持开关关闭）
+  private async requestCalPerms(): Promise<boolean> {
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      const need: Permissions[] = [
+        'ohos.permission.WRITE_CALENDAR',
+        'ohos.permission.READ_CALENDAR'
+      ];
+      const result = await abilityAccessCtrl.createAtManager()
+        .requestPermissionsFromUser(ctx, need);
+      const rs: number[] = result.authResults;
+      for (let i = 0; i < rs.length; i++) {
+        if (rs[i] !== 0) {
+          return false;
+        }
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 设置页开关：开启前先申请日历权限，关闭则只停后续写入（已建日程保留）
+  async setCal(on: boolean): Promise<void> {
+    if (on) {
+      const granted: boolean = await this.requestCalPerms();
+      if (!granted) {
+        this.calOn = false;
+        promptAction.showToast({ message: '需允许读写日历才能自动加入日程' });
+        return;
+      }
+      this.calOn = true;
+      saveCalOn(getContext(this) as common.Context, true);
+      promptAction.showToast({ message: '已开启：即将免费的游戏会自动加入系统日历' });
+      // 若已拉到过“即将免费”，立刻补写一次并提示数量
+      this.syncCalToCalendar(true);
+    } else {
+      this.calOn = false;
+      saveCalOn(getContext(this) as common.Context, false);
+      promptAction.showToast({ message: '已关闭：不再自动把免费游戏加入日历' });
+    }
+  }
+
+  // 把“即将免费”写入系统日历。tip=false（后台刷新自动触发）不弹提示；
+  // tip=true（用户刚开启开关）提示本次新增条数。
+  private async syncCalToCalendar(tip: boolean): Promise<void> {
+    if (!this.calOn || this.calSyncing || this.soonList.length === 0) {
+      return;
+    }
+    this.calSyncing = true;
+    try {
+      const ctx = getContext(this) as common.Context;
+      const copy: GameItem[] = [];
+      for (let i = 0; i < this.soonList.length; i++) {
+        copy.push(this.soonList[i]);
+      }
+      const added: number = await addFreeToCalendar(ctx, copy);
+      if (tip && added > 0) {
+        promptAction.showToast({ message: '已将 ' + added + ' 个即将免费的游戏加入日历' });
+      }
+    } catch (e) {
+      // 权限被收回/系统日历异常：静默跳过，等下次刷新再试
+    }
+    this.calSyncing = false;
+  }
+
   // ================= 首页头部 =================
 
   @Builder
@@ -554,7 +864,7 @@ struct Index {
 
       if (item.claim.length > 0) {
         if (this.claimAuto && this.isClaimed(item.title)) {
-          // 自动领取模式下已入库：灰底标记，点击仅提示
+          // 自动领取模式下已入库：灰底标记，点击重新进入游戏页浏览
           Text('已领取')
             .fontSize(12)
             .fontWeight(FontWeight.Medium)
@@ -564,7 +874,7 @@ struct Index {
             .borderRadius(16)
             .margin({ left: 10 })
             .onClick(() => {
-              promptAction.showToast({ message: '该游戏已在库中' });
+              this.openBrowser(item.claim);
             })
         } else {
           // 按领取方式显示：跳转=去领取（浏览器），自动=自动领取（应用内脚本）
@@ -641,6 +951,147 @@ struct Index {
     }
   }
 
+  // ================= 历史页 =================
+
+  @Builder
+  HistoryHeader() {
+    Column({ space: 3 }) {
+      Text('历史')
+        .fontSize(22)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(COLOR_TEXT)
+      Text('EPIC 送过的免费游戏 · 共 ' + this.histList.length + ' 期')
+        .fontSize(12)
+        .fontColor(COLOR_SUB)
+    }
+    .alignItems(HorizontalAlign.Start)
+    .width('100%')
+    .padding({
+      left: 16,
+      right: 16,
+      top: this.getUIContext().px2vp(this.topInset) + 10,
+      bottom: 8
+    })
+  }
+
+  // 历史单卡：右侧状态用“色字”区分（绿=已领取 蓝=免费中 灰=已结束），不做跳动的标签布局
+  @Builder
+  HistoryCard(h: HistItem) {
+    Row() {
+      if (h.img.length > 0) {
+        Image(h.img)
+          .width(100)
+          .height(62)
+          .borderRadius(10)
+          .objectFit(ImageFit.Cover)
+          .backgroundColor(COLOR_IMG_BG)
+          .margin({ right: 12 })
+      } else {
+        // 第三方历史源不提供封面图：显示“标题首字母”占位块，保证卡片版式与本地记录一致
+        Column() {
+          Text(h.t.length > 0 ? h.t.charAt(0).toUpperCase() : '?')
+            .fontSize(24)
+            .fontWeight(FontWeight.Medium)
+            .fontColor('#48484A')
+        }
+        .width(100)
+        .height(62)
+        .borderRadius(10)
+        .backgroundColor(COLOR_IMG_BG)
+        .justifyContent(FlexAlign.Center)
+        .margin({ right: 12 })
+      }
+
+      Column({ space: 4 }) {
+        Row() {
+          Text(h.t)
+            .fontSize(15)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(COLOR_TEXT)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+          Text(this.histStatus(h))
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.histColor(h))
+            .margin({ left: 10 })
+        }
+        .width('100%')
+
+        Text(this.histRange(h))
+          .fontSize(12)
+          .fontColor(COLOR_SUB)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+    }
+    .width('100%')
+    .padding({ left: 12, right: 12, top: 12, bottom: 12 })
+    .backgroundColor(COLOR_CARD)
+    .borderRadius(14)
+    .onClick(() => {
+      this.tapHist(h);
+    })
+  }
+
+  @Builder
+  HistoryView() {
+    if (this.histList.length === 0) {
+      Column({ space: 10 }) {
+        Text('还没有历史记录')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(COLOR_TEXT)
+        Text('本应用检测到的每期免费游戏会自动记录在这里')
+          .fontSize(13)
+          .fontColor(COLOR_SUB)
+      }
+      .width('100%')
+      .padding({ top: 140, bottom: 140 })
+      .justifyContent(FlexAlign.Center)
+    } else {
+      Scroll() {
+        Column({ space: 12 }) {
+          // 按月分组：每组 = 月份小标题 + 该月全部卡片（分组整体原子追加）
+          ForEach(this.histGroups(), (g: HistGroup) => {
+            Column({ space: 10 }) {
+              Text(g.label)
+                .fontSize(13)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(COLOR_SUB)
+                .width('100%')
+              ForEach(g.items, (h: HistItem) => {
+                this.HistoryCard(h)
+              }, (h: HistItem) => h.t + h.seenMs)
+            }
+            .width('100%')
+          }, (g: HistGroup) => g.label)
+          // 还有更多未展示时给出提示；滑到此处触发 onReachEnd 追加下一页
+          if (this.histShown.length < this.histList.length) {
+            Text('上滑加载更多 · 已显示 ' + this.histShown.length + ' / ' + this.histList.length)
+              .fontSize(12)
+              .fontColor(COLOR_SUB)
+              .width('100%')
+              .textAlign(TextAlign.Center)
+              .padding({ top: 8, bottom: 10 })
+          }
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 2, bottom: 24 })
+      }
+      .scrollBar(BarState.Off)
+      .align(Alignment.Top)
+      .width('100%')
+      .layoutWeight(1)
+      .onReachEnd(() => {
+        this.loadMoreHistory();
+      })
+    }
+  }
+
   // ================= 设置页 =================
 
   @Builder
@@ -683,6 +1134,35 @@ struct Index {
         .selectedColor(COLOR_ACCENT)
         .onChange((isOn: boolean) => {
           this.setNotify(isOn);
+        })
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+    .margin({ left: 16, right: 16, top: 8 })
+    .backgroundColor(COLOR_CARD)
+    .borderRadius(14)
+  }
+
+  // “自动加入日历”开关行：把“即将免费”的开领日自动写成系统日历全天日程
+  @Builder
+  CalRow() {
+    Row() {
+      Column({ space: 4 }) {
+        Text('加入日历提醒')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(COLOR_TEXT)
+        Text('把“即将免费”的开领日写为当天全天日程并提醒')
+          .fontSize(12)
+          .fontColor(COLOR_SUB)
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      Toggle({ type: ToggleType.Switch, isOn: this.calOn })
+        .selectedColor(COLOR_ACCENT)
+        .onChange((isOn: boolean) => {
+          this.setCal(isOn);
         })
     }
     .width('100%')
@@ -849,7 +1329,7 @@ struct Index {
     .height('100%')
     .justifyContent(FlexAlign.Center)
     .onClick(() => {
-      this.curTab = index;
+      this.switchTab(index);
     })
   }
 
@@ -862,7 +1342,8 @@ struct Index {
         .backgroundColor(COLOR_LINE)
       Row() {
         this.TabItem('游戏', 0)
-        this.TabItem('设置', 1)
+        this.TabItem('历史', 1)
+        this.TabItem('设置', 2)
       }
       .width('100%')
       .height(52)
@@ -885,12 +1366,22 @@ struct Index {
         .height('100%')
         .visibility(this.curTab === 0 ? Visibility.Visible : Visibility.None)
 
-        // 页 2：设置
+        // 页 2：历史（常驻组件树，仅切换显隐）
+        Column() {
+          this.HistoryHeader()
+          this.HistoryView()
+        }
+        .width('100%')
+        .height('100%')
+        .visibility(this.curTab === 1 ? Visibility.Visible : Visibility.None)
+
+        // 页 3：设置
         Column() {
           this.SettingsHeader()
           Scroll() {
             Column({ space: 0 }) {
               this.NotifyRow()
+              this.CalRow()
               this.ClaimModeCard()
               // 智感握持只作用于自动领取模式的悬浮按钮，自动领取开启时才展示开关
               if (this.claimAuto) {
@@ -907,7 +1398,7 @@ struct Index {
         }
         .width('100%')
         .height('100%')
-        .visibility(this.curTab === 1 ? Visibility.Visible : Visibility.None)
+        .visibility(this.curTab === 2 ? Visibility.Visible : Visibility.None)
 
         // 悬浮按钮：仅自动领取模式 + 游戏页 + 列表就绪时展示；点击手动开始批量领取
         if (this.curTab === 0 && this.claimAuto && !this.loading && !this.failed &&

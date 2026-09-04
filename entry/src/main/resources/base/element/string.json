@@ -11,6 +11,14 @@
     {
       "name": "EntryAbility_label",
       "value": "EPIC喜加一"
+    },
+    {
+      "name": "write_calendar_reason",
+      "value": "用于把即将免费的 EPIC 游戏自动写入系统日历，开领当天收到提醒"
+    },
+    {
+      "name": "read_calendar_reason",
+      "value": "用于读取本应用写入的日历日程，避免重复添加"
     }
   ]
 }

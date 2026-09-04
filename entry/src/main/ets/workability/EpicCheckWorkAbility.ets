@@ -16,6 +16,7 @@ import {
   publishFreeNotice,
   GameItem
 } from '../common/EpicFree';
+import { recordFreeNow } from '../common/FreeHistory';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'EpicCheckWork';
@@ -59,6 +60,8 @@ export default class EpicCheckWorkAbility extends WorkSchedulerExtensionAbility 
       if (merged.length !== seen.length) {
         await saveSeen(ctx, merged);
       }
+      // 无论是否新增，都把这批“现在免费”并入历史存档（重复检测会自动去重）
+      await recordFreeNow(ctx, nowArr);
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'doCheck failed: %{public}s', JSON.stringify(e));
     }
