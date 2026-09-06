@@ -32,18 +32,28 @@ import {
 } from '../common/EpicFree';
 import { HistItem, recordFreeNow, readHistoryMerged, backfillHistCovers } from '../common/FreeHistory';
 
-// ================= 配色（参考 HarmonyOS 系统应用：黑底 + 深灰卡片 + 系统蓝） =================
+// ================= 配色（通透玻璃拟态：近黑冷底 + 环境光晕 + 半透明磨砂面） =================
 
-const COLOR_BG: string = '#000000';
-const COLOR_CARD: string = '#1C1C1E';
-const COLOR_IMG_BG: string = '#2C2C2E';
+const COLOR_BG: string = '#05070D';        // 最底近黑，带一丝冷蓝，替代纯黑
+const COLOR_CARD: string = '#1AFFFFFF';    // 磨砂卡片：白 10% 叠加在光晕上，透光不透字
+const COLOR_HAIR: string = '#2BFFFFFF';    // 玻璃描边：白 17%，勾勒“脆边”
+const COLOR_IMG_BG: string = '#111722';    // 图片底：深蓝黑，承载占位首字母
+const COLOR_BADGE: string = '#33FFFFFF';   // “已领取”等中性标记底
 const COLOR_TEXT: string = '#FFFFFF';
 const COLOR_SUB: string = '#8E8E93';
-const COLOR_LINE: string = '#2C2C2E';
 const COLOR_ACCENT: string = '#0A59F7';
+const COLOR_ACCENT_HI: string = '#2F6DFF'; // 强调高光端（胶囊内选中光晕使用）
 const COLOR_OK: string = '#34C759';
 // 历史页“滑动加载更多”：首次只渲染一页，滑到底部再按此数量追加（避免上千条一次性全部渲染）
 const HIST_PAGE: number = 20;
+// ================= 悬浮胶囊底栏几何（克制不动布局：仅收窄原整宽栏为居中胶囊） =================
+const NAV_W: number = 236;                 // 胶囊总宽
+const NAV_H: number = 56;                  // 胶囊高
+const NAV_EDGE: number = 8;                // 胶囊内边距，让高亮远离圆角
+const NAV_INNER_W: number = NAV_W - NAV_EDGE * 2;  // 内容区宽 220
+const NAV_SEG: number = NAV_INNER_W / 3;           // 每格约 73.3
+const NAV_PILL_W: number = 64;             // 选中高亮块宽
+const NAV_PILL_H: number = 38;             // 选中高亮块高
 
 // ================= 历史“按月分组” =================
 // 历史列表按开领时刻倒序，天然按“年-月”连续成段；这里负责分组的键/标题，
@@ -102,6 +112,8 @@ struct Index {
   // 已自动领取成功入库的游戏标题（卡片据此显示“已领取”并跳过重复尝试）
   @State claimedTitles: string[] = [];
   @State curTab: number = 0;
+  // 当前被按住的卡片键（用于克制微动效：按压 0.985 微缩），松手清空
+  @State pressedKey: string = '';
   // 智感握持开关：true=悬浮按钮跟随握持手左右换角（默认开启）
   @State gripOn: boolean = true;
   // 关闭智感握持时手动固定的按钮位置：true=右下角，false=左下角
@@ -448,6 +460,27 @@ struct Index {
     if (index === 1) {
       this.fillVisibleHistCovers();
     }
+  }
+
+  // 悬浮胶囊底栏：选中高亮块相对“中间格”的横向位移（正中=历史，左=游戏，右=设置）
+  private pillX(): number {
+    return (this.curTab - 1) * NAV_SEG;
+  }
+
+  // 卡片按压微缩放：按住 key 匹配时 0.985，其余 1（克制，不位移不改布局）
+  private pressScale(key: string): number {
+    return this.pressedKey === key ? 0.985 : 1;
+  }
+
+  // 悬浮胶囊盖在内容区底部之上：滚动内容需能滚入其下，
+  // 底部预留“胶囊高 + 手势条 + 呼吸间隙”，让最后一项能滚出胶囊可视区。
+  private overlayReserve(): number {
+    return this.getUIContext().px2vp(this.bottomInset) + NAV_H + 26;
+  }
+
+  // 自动领取悬浮按钮抬起到底部胶囊上方的底边距
+  private fabLiftPad(): number {
+    return this.getUIContext().px2vp(this.bottomInset) + NAV_H + 22;
   }
 
   // 把 histShown 按“年月”聚合成展示分组（histShown 的终点始终对齐整月，
@@ -870,7 +903,7 @@ struct Index {
             .fontWeight(FontWeight.Medium)
             .fontColor(COLOR_SUB)
             .padding({ left: 14, right: 14, top: 8, bottom: 8 })
-            .backgroundColor(COLOR_IMG_BG)
+            .backgroundColor(COLOR_BADGE)
             .borderRadius(16)
             .margin({ left: 10 })
             .onClick(() => {
@@ -895,7 +928,17 @@ struct Index {
     .width('100%')
     .padding({ left: 12, right: 12, top: 12, bottom: 12 })
     .backgroundColor(COLOR_CARD)
-    .borderRadius(14)
+    .border({ width: 1, color: COLOR_HAIR })
+    .borderRadius(16)
+    .onTouch((e: TouchEvent) => {
+      if (e.type === TouchType.Down) {
+        this.pressedKey = item.title;
+      } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.pressedKey === item.title) {
+        this.pressedKey = '';
+      }
+    })
+    .scale({ x: this.pressScale(item.title), y: this.pressScale(item.title) })
+    .animation({ duration: 160, curve: Curve.FastOutSlowIn })
   }
 
   @Builder
@@ -929,8 +972,8 @@ struct Index {
         }
       }
       .width('100%')
-      // 自动领取模式下悬浮按钮会盖住滚动区底部，预留避让空间
-      .padding({ left: 16, right: 16, top: 2, bottom: this.claimAuto ? 96 : 24 })
+      // 胶囊悬浮盖在内容上：滚动区底部按“胶囊高+手势条”预留，让最后一项能滚出胶囊
+      .padding({ left: 16, right: 16, top: 2, bottom: this.claimAuto ? (this.fabLiftPad() + 52) : this.overlayReserve() })
     }
     .scrollBar(BarState.Off)
     .align(Alignment.Top)
@@ -992,7 +1035,7 @@ struct Index {
           Text(h.t.length > 0 ? h.t.charAt(0).toUpperCase() : '?')
             .fontSize(24)
             .fontWeight(FontWeight.Medium)
-            .fontColor('#48484A')
+            .fontColor('#5A6570')
         }
         .width(100)
         .height(62)
@@ -1031,7 +1074,17 @@ struct Index {
     .width('100%')
     .padding({ left: 12, right: 12, top: 12, bottom: 12 })
     .backgroundColor(COLOR_CARD)
-    .borderRadius(14)
+    .border({ width: 1, color: COLOR_HAIR })
+    .borderRadius(16)
+    .onTouch((e: TouchEvent) => {
+      if (e.type === TouchType.Down) {
+        this.pressedKey = h.t;
+      } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.pressedKey === h.t) {
+        this.pressedKey = '';
+      }
+    })
+    .scale({ x: this.pressScale(h.t), y: this.pressScale(h.t) })
+    .animation({ duration: 160, curve: Curve.FastOutSlowIn })
     .onClick(() => {
       this.tapHist(h);
     })
@@ -1080,7 +1133,7 @@ struct Index {
           }
         }
         .width('100%')
-        .padding({ left: 16, right: 16, top: 2, bottom: 24 })
+        .padding({ left: 16, right: 16, top: 2, bottom: this.overlayReserve() })
       }
       .scrollBar(BarState.Off)
       .align(Alignment.Top)
@@ -1101,9 +1154,11 @@ struct Index {
         .fontSize(22)
         .fontWeight(FontWeight.Medium)
         .fontColor(COLOR_TEXT)
-      Text('通知与提醒')
+      Text('管理提醒与领取偏好')
         .fontSize(12)
         .fontColor(COLOR_SUB)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
     }
     .alignItems(HorizontalAlign.Start)
     .width('100%')
@@ -1111,8 +1166,19 @@ struct Index {
       left: 16,
       right: 16,
       top: this.getUIContext().px2vp(this.topInset) + 10,
-      bottom: 8
+      bottom: 4
     })
+  }
+
+  // 设置页分组小标题：与“历史页月份标题”同风格（13sp 次要色），把同类设置归成一组
+  @Builder
+  SettingsGroupTitle(title: string, top: number) {
+    Text(title)
+      .fontSize(13)
+      .fontWeight(FontWeight.Medium)
+      .fontColor(COLOR_SUB)
+      .width('100%')
+      .padding({ top: top, bottom: 8 })
   }
 
   @Builder
@@ -1138,9 +1204,19 @@ struct Index {
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 14, bottom: 14 })
-    .margin({ left: 16, right: 16, top: 8 })
+    .margin({ top: 8 })
     .backgroundColor(COLOR_CARD)
-    .borderRadius(14)
+    .border({ width: 1, color: COLOR_HAIR })
+    .borderRadius(16)
+    .onTouch((e: TouchEvent) => {
+      if (e.type === TouchType.Down) {
+        this.pressedKey = 'SetNotify';
+      } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.pressedKey === 'SetNotify') {
+        this.pressedKey = '';
+      }
+    })
+    .scale({ x: this.pressScale('SetNotify'), y: this.pressScale('SetNotify') })
+    .animation({ duration: 160, curve: Curve.FastOutSlowIn })
   }
 
   // “自动加入日历”开关行：把“即将免费”的开领日自动写成系统日历全天日程
@@ -1167,9 +1243,19 @@ struct Index {
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 14, bottom: 14 })
-    .margin({ left: 16, right: 16, top: 8 })
+    .margin({ top: 8 })
     .backgroundColor(COLOR_CARD)
-    .borderRadius(14)
+    .border({ width: 1, color: COLOR_HAIR })
+    .borderRadius(16)
+    .onTouch((e: TouchEvent) => {
+      if (e.type === TouchType.Down) {
+        this.pressedKey = 'SetCal';
+      } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.pressedKey === 'SetCal') {
+        this.pressedKey = '';
+      }
+    })
+    .scale({ x: this.pressScale('SetCal'), y: this.pressScale('SetCal') })
+    .animation({ duration: 160, curve: Curve.FastOutSlowIn })
   }
 
   // 智感握持开关行里的“位置分段”单项（manualRight 选中态由 @Builder 外层传入 right 判断）
@@ -1229,10 +1315,20 @@ struct Index {
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 14, bottom: 14 })
-    .margin({ left: 16, right: 16, top: 8 })
+    .margin({ top: 8 })
     .backgroundColor(COLOR_CARD)
-    .borderRadius(14)
+    .border({ width: 1, color: COLOR_HAIR })
+    .borderRadius(16)
     .alignItems(HorizontalAlign.Start)
+    .onTouch((e: TouchEvent) => {
+      if (e.type === TouchType.Down) {
+        this.pressedKey = 'SetGrip';
+      } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.pressedKey === 'SetGrip') {
+        this.pressedKey = '';
+      }
+    })
+    .scale({ x: this.pressScale('SetGrip'), y: this.pressScale('SetGrip') })
+    .animation({ duration: 160, curve: Curve.FastOutSlowIn })
   }
 
   // 设置页：领取方式切换段。mode=false=跳转领取，true=自动领取
@@ -1255,19 +1351,11 @@ struct Index {
   @Builder
   ClaimModeCard() {
     Column({ space: 12 }) {
-      Row() {
-        Column({ space: 4 }) {
-          Text('领取方式')
-            .fontSize(16)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(COLOR_TEXT)
-          Text(this.claimAuto ? '不自动开始：点游戏页下角悬浮按钮批量领取' : '点击卡片用系统浏览器打开领取页')
-            .fontSize(12)
-            .fontColor(COLOR_SUB)
-        }
-        .alignItems(HorizontalAlign.Start)
-      }
-      .width('100%')
+      // 当前领取方式说明（方式名称已由分组标题给出，这里只描述对应行为）
+      Text(this.claimAuto ? '开启后回到游戏页，点悬浮按钮批量代领' : '点击卡片用系统浏览器打开领取页')
+        .fontSize(12)
+        .fontColor(COLOR_SUB)
+        .width('100%')
 
       // 跳转领取 / 自动领取 二选一切换
       Row() {
@@ -1301,21 +1389,31 @@ struct Index {
             .fontColor(COLOR_ACCENT)
         }
         .width('100%')
-        .padding({ top: 2, bottom: 2 })
+        .padding({ top: 4, bottom: 4 })
+        .onTouch((e: TouchEvent) => {
+          if (e.type === TouchType.Down) {
+            this.pressedKey = 'SetLogin';
+          } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.pressedKey === 'SetLogin') {
+            this.pressedKey = '';
+          }
+        })
+        .scale({ x: this.pressScale('SetLogin'), y: this.pressScale('SetLogin') })
+        .animation({ duration: 160, curve: Curve.FastOutSlowIn })
         .onClick(() => {
           this.pushClaimLogin();
         })
       }
     }
     .width('100%')
-    .padding({ left: 16, right: 16, top: 16, bottom: 16 })
-    .margin({ left: 16, right: 16, top: 8 })
+    .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+    .margin({ top: 8 })
     .backgroundColor(COLOR_CARD)
-    .borderRadius(14)
+    .border({ width: 1, color: COLOR_HAIR })
+    .borderRadius(16)
     .alignItems(HorizontalAlign.Start)
   }
 
-  // ================= 底部导航栏 =================
+  // ================= 底部悬浮胶囊导航 =================
 
   @Builder
   TabItem(label: string, index: number) {
@@ -1333,29 +1431,78 @@ struct Index {
     })
   }
 
+  // 悬浮玻璃胶囊本体：内层是“选中高亮块 + 三个等分点击格”。
+  // 高亮默认被 Stack 居中在“历史”格，translate 依 curTab 平滑左右滑位（克制动效、无跳动）。
   @Builder
-  BottomBar() {
-    Column() {
-      Row()
-        .width('100%')
-        .height(1)
-        .backgroundColor(COLOR_LINE)
+  NavCapsule() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column()
+        .width(NAV_PILL_W)
+        .height(NAV_PILL_H)
+        .borderRadius(NAV_PILL_H / 2)
+        .linearGradient({ angle: 90, colors: [[COLOR_ACCENT, 0.0], [COLOR_ACCENT_HI, 1.0]] })
+        .shadow({ radius: 12, color: '#590A59F7', offsetY: 4 })
+        .translate({ x: this.pillX() })
+        .animation({ duration: 300, curve: Curve.FastOutSlowIn })
+
       Row() {
         this.TabItem('游戏', 0)
         this.TabItem('历史', 1)
         this.TabItem('设置', 2)
       }
       .width('100%')
-      .height(52)
+      .height('100%')
+    }
+    .width(NAV_W)
+    .height(NAV_H)
+    .padding({ left: NAV_EDGE, right: NAV_EDGE })
+    .borderRadius(NAV_H / 2)
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 1, color: COLOR_HAIR })
+    .shadow({ radius: 26, color: '#40050A14', offsetY: 10 })
+  }
+
+  // ================= 沉浸光感背景 =================
+  // 三层全屏渐变叠加：基色冷黑 + 右上主蓝光 + 左下紫光，
+  // 磨砂面/悬浮胶囊的 blur 才有“背后有光”的玻璃感。
+
+  @Builder
+  GlowBackdrop() {
+    Stack() {
+      Column()
+        .width('100%')
+        .height('100%')
+        .linearGradient({
+          angle: 180,
+          colors: [['#111D33', 0.0], ['#070C16', 0.55], ['#04060C', 1.0]]
+        })
+      Column()
+        .width('100%')
+        .height('100%')
+        .radialGradient({
+          center: ['80%', '-4%'],
+          radius: '92%',
+          colors: [['#4A0A59F7', 0.0], ['#1A0A59F7', 0.42], ['#000A59F7', 1.0]]
+        })
+      Column()
+        .width('100%')
+        .height('100%')
+        .radialGradient({
+          center: ['6%', '116%'],
+          radius: '95%',
+          colors: [['#384A3AF0', 0.0], ['#124A3AF0', 0.5], ['#004A3AF0', 1.0]]
+        })
     }
     .width('100%')
-    .padding({ bottom: this.getUIContext().px2vp(this.bottomInset) })
+    .height('100%')
   }
 
   build() {
-    Column() {
-      // 悬浮按钮需贴在“游戏页内容区”的下角，而底部的导航栏在其下方；
-      // fabAlign 由智感握姿驱动：右手→右下，左手→左下
+    // 最外层 Stack（底对齐）：光晕铺底 → 全屏内容 → 悬浮胶囊盖在最上层
+    Stack({ alignContent: Alignment.Bottom }) {
+      this.GlowBackdrop()
+
+      // 三页内容占满全屏、可滚到胶囊下方被其覆盖，形成“底部导航悬浮于内容之上”的沉浸效果
       Stack({ alignContent: this.fabAlign }) {
         // 页 1：游戏列表（常驻组件树，仅切换显隐，保留滚动位置）
         Column() {
@@ -1379,17 +1526,23 @@ struct Index {
         Column() {
           this.SettingsHeader()
           Scroll() {
-            Column({ space: 0 }) {
+            // 统一内容边距；设置项按“语义分组 + 小标题”排布
+            Column() {
+              this.SettingsGroupTitle('提醒与通知', 2)
               this.NotifyRow()
               this.CalRow()
+
+              this.SettingsGroupTitle('领取方式', 24)
               this.ClaimModeCard()
-              // 智感握持只作用于自动领取模式的悬浮按钮，自动领取开启时才展示开关
+
+              // 智感握持只作用于自动领取模式的悬浮按钮，自动领取开启时才展示该组
               if (this.claimAuto) {
+                this.SettingsGroupTitle('悬浮按钮', 24)
                 this.GripRow()
               }
             }
             .width('100%')
-            .padding({ bottom: 24 })
+            .padding({ left: 16, right: 16, bottom: this.overlayReserve() })
           }
           .scrollBar(BarState.Off)
           .align(Alignment.Top)
@@ -1411,11 +1564,11 @@ struct Index {
             .backgroundColor(COLOR_ACCENT)
             .borderRadius(22)
             .shadow({ radius: 14, color: '#660A59F7', offsetY: 5 })
-            // 跟手对齐：贴在右下给右边距，贴在左下给左边距
+            // 跟手对齐：贴在右下给右边距，贴在左下给左边距；整体抬升到底部悬浮胶囊之上
             .margin({
               left: this.fabAlign === Alignment.BottomStart ? 16 : 0,
               right: this.fabAlign === Alignment.BottomEnd ? 16 : 0,
-              bottom: 14
+              bottom: this.fabLiftPad()
             })
             .onClick(() => {
               this.startAutoClaim();
@@ -1423,9 +1576,16 @@ struct Index {
         }
       }
       .width('100%')
-      .layoutWeight(1)
+      .height('100%')
 
-      this.BottomBar()
+      // 悬浮胶囊盖在内容最上层：居中贴底，胶囊之外点击透明穿透到下方内容
+      Column() {
+        this.NavCapsule()
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Center)
+      .hitTestBehavior(HitTestMode.Transparent)
+      .padding({ bottom: this.getUIContext().px2vp(this.bottomInset) + 12 })
     }
     .width('100%')
     .height('100%')
