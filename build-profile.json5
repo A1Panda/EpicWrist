@@ -7,11 +7,11 @@
         "material": {
           "certpath": "C:\\Users\\A1_Pa\\.ohos\\config\\default_EpicWrist_1rHMXyiymOv3xXadkg62Oz0PDkRUUBRp6QjmphN8pN0=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001AD316A1EA05E46182520191ADFCECA70D202AB9A12629FF94559494885FA3991DF35443B4421B",
+          "keyPassword": "0000001B913694E2505E2A04A4B510AD75B8AD2DA6B8DAD1845CED4593D0CED650A97786E9BBD8ECA5265F",
           "profile": "C:\\Users\\A1_Pa\\.ohos\\config\\default_EpicWrist_1rHMXyiymOv3xXadkg62Oz0PDkRUUBRp6QjmphN8pN0=.p7b",
           "signAlg": "SHA256withECDSA",
           "storeFile": "C:\\Users\\A1_Pa\\.ohos\\config\\default_EpicWrist_1rHMXyiymOv3xXadkg62Oz0PDkRUUBRp6QjmphN8pN0=.p12",
-          "storePassword": "0000001A3573DCF6102942750997BC5ED3D3F7FC58D41EBE8E97323F862C314F57686952DB96D039C3AB"
+          "storePassword": "0000001B20961DB59108E42AB117152DCF7194A0E108CEBB36861B99F4CB37ACBCECC73C9F9C7E219B86FB"
         }
       }
     ],
@@ -19,8 +19,8 @@
       {
         "name": "default",
         "signingConfig": "default",
-        "targetSdkVersion": "6.1.1(24)",
-        "compatibleSdkVersion": "6.1.1(24)",
+        "targetSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "26.0.0",
         "runtimeOS": "HarmonyOS",
         "buildOption": {
           "strictMode": {

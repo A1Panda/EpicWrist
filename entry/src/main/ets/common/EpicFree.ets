@@ -29,13 +29,24 @@ export const NOTIFY_KEY: string = 'notifyEnabled'; // “新免费提醒”开�
 export const CLAIM_MODE_KEY: string = 'claimAuto';  // 领取方式：true=自动领取 false=跳转领取
 export const GRIP_KEY: string = 'gripAdapt';        // 智感握持开关：true=按钮跟随握持手换角
 export const FAB_RIGHT_KEY: string = 'fabSideRight'; // 智感握持关闭时手动固定按钮：true=右下角 false=左下角
+export const GLOW_KEY: string = 'glowLevel';        // 沉浸光效强度档位：0=柔和 1=标准(默认) 2=增强
 export const CLAIMED_KEY: string = 'claimedTitles'; // 自动领取已成功入库的游戏标题
 export const CAL_KEY: string = 'calOn';             // “自动把即将免费加入日历”开关
 export const CAL_DONE_KEY: string = 'calDone';      // 已写入系统日历的 “标题|开领日期” 数组（去重用）
+export const LAST_LISTS_KEY: string = 'lastFreeLists'; // 最近一次成功拉到的列表（弱网时兜底秒开）
+export const LAST_MOBILE_KEY: string = 'lastMobileFree'; // 最近一次成功拉到的手机免费游戏（手机接口偶发失败时兜底）
 
 // EPIC 登录/领取页地址（自动领取=内置网页模拟用户点“获取”，需保持 EPIC 登录态）
 export const CLAIM_LOGIN_URL: string = 'https://accounts.epicgames.com/login';
 export const CLAIM_STORE_URL: string = 'https://store.epicgames.com/free-games';
+
+// 手机“周免”与 PC 周免是两批不同的游戏（如 Evan's Remains 只在手机免费）。
+// 手机数据由 FreeHistory 的 josephmate 全量名单（platform=android 行）提供；
+// EPIC 手机接口会拦原生 http（Cloudflare 403），已不再直接请求。
+// 手机免费游戏统一跳转的移动商店页（有商品 slug 时优先精确跳商品页）
+export const MOBILE_STORE_URL: string = 'https://store.epicgames.com/mobile';
+// GameItem.platform 的取值：手机免费游戏标 'mobile'（PC 免费缺省不标）
+export const PLATFORM_MOBILE: string = 'mobile';
 
 // 通知 ID 与 WorkScheduler 任务 ID（同应用内不与其他任务冲突即可）
 export const NOTICE_ID: number = 1001;
@@ -49,6 +60,7 @@ export const CHECK_CYCLE_MS: number = 12 * 60 * 60 * 1000;
 
 // 列表条目：title=游戏名，sub=副标题，img=封面图 URL，claim=官方领取页 URL（空则不可领取），
 // startMs=（即将免费按此排序）开领时刻，endMs=该期免费截止时刻（可选，历史记录用）
+// platform=平台标记（'mobile' 为 Android 手机免费游戏，缺省为 PC 每周免费）
 export interface GameItem {
   title: string;
   sub: string;
@@ -56,11 +68,19 @@ export interface GameItem {
   claim: string;
   startMs: number;
   endMs?: number;
+  platform?: string;
 }
 
 export interface FreeLists {
   nowArr: GameItem[];
   soonArr: GameItem[];
+}
+
+// 弱网兜底缓存：最近一次成功拉到的列表（结构同 FreeLists，另记存档时刻便于诊断）
+export interface LastLists {
+  nowArr: GameItem[];
+  soonArr: GameItem[];
+  at: number;
 }
 
 // 自动领取任务项：t=游戏名，url=官方领取页
@@ -239,29 +259,74 @@ function pickFree(groups: PromoGroup[] | undefined, now: number, wantNow: boolea
 
 // ================= 抓取与解析 =================
 
-// 请求一次接口；拿到文本 resolve；网络/非 200 一律 reject
-export function requestFreeText(): Promise<string> {
+// 请求一次接口；拿到文本 resolve；网络/非 200/超时一律 reject。
+// 内置 20s 看门狗：极差网络下若连接半开、响应迟迟不回来（readTimeout 不触发），
+// 也会强制按失败收尾，保证调用方永远不会停在“一直加载中”。
+function requestText(url: string, errName: string, header?: Object): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const req = http.createHttp();
+    let done: boolean = false;
+    const finishErr = (e: BusinessError): void => {
+      if (done) {
+        return;
+      }
+      done = true;
+      try {
+        req.destroy();
+      } catch (e2) {
+      }
+      reject(e);
+    };
+    const guard: number = setTimeout(() => {
+      const te: BusinessError = { code: 10505002, name: 'TimeoutError', message: errName + '超时' } as BusinessError;
+      finishErr(te);
+    }, 20000);
+    const options: http.HttpRequestOptions = {
+      method: http.RequestMethod.GET,
+      connectTimeout: 10000,
+      readTimeout: 15000,
+      expectDataType: http.HttpDataType.STRING
+    };
+    if (header !== undefined) {
+      options.header = header;
+    }
     req.request(
-      API_URL + '?locale=' + API_LOCALE + '&country=' + API_COUNTRY + '&allowCountries=' + API_COUNTRY,
-      {
-        method: http.RequestMethod.GET,
-        connectTimeout: 10000,
-        readTimeout: 15000,
-        expectDataType: http.HttpDataType.STRING
-      },
+      url,
+      options,
       (err: BusinessError, data: http.HttpResponse) => {
+        clearTimeout(guard);
+        if (done) {
+          return;
+        }
+        done = true;
         req.destroy();
         if (!err && data.responseCode === 200) {
           resolve(String(data.result));
-        } else {
+        } else if (err) {
           reject(err);
+        } else {
+          // HTTP 层成功但状态码非 200（如 Cloudflare 403）：把状态码放进错误，供上层日志定位
+          const be: BusinessError = {
+            code: data.responseCode,
+            name: 'HttpError',
+            message: errName + ' HTTP ' + data.responseCode
+          } as BusinessError;
+          reject(be);
         }
       }
     );
   });
 }
+
+// PC 每周免费促销接口
+export function requestFreeText(): Promise<string> {
+  return requestText(
+    API_URL + '?locale=' + API_LOCALE + '&country=' + API_COUNTRY + '&allowCountries=' + API_COUNTRY,
+    'EPIC 接口请求'
+  );
+}
+
+// 手机限免改由 FreeHistory.currentMobileFree（josephmate 名单 platform=android 行）提供，接口请求已废弃。
 
 // 解析接口文本，分类出“现在免费”与“即将免费”
 // 返回 null 表示数据格式异常（页面应显示失败；后台任务应静默跳过本次）
@@ -291,12 +356,16 @@ export function parseFree(text: string): FreeLists | null {
       const cur = pickFree(promo.promotionalOffers, nowMs, true);
       if (cur) {
         if (nowArr.length < MAX_NOW) {
+          // 档期起点用促销真实 startDate：一款游戏连续免费多天时，
+          // 若按“检测时刻”当 startMs，跨天检测会生成不同的“标题|日期”去重键，
+          // 导致同一期被当成多期重复写入历史；用真实开领日则整期恒定。
+          const curStart: number = Date.parse(cur.startDate);
           const item: GameItem = {
             title: el.title,
             sub: '免费至 ' + fmtMdHm(Date.parse(cur.endDate)),
             img: pickGameImage(el.keyImages),
             claim: claimUrlOf(el),
-            startMs: nowMs,
+            startMs: curStart > 0 ? curStart : nowMs,
             endMs: Date.parse(cur.endDate)
           };
           nowArr.push(item);
@@ -347,6 +416,62 @@ export async function saveSeen(context: common.Context, list: string[]): Promise
     await p.flush();
   } catch (e) {
     // 存档失败不阻断主流程
+  }
+}
+
+// 存档“最近一次成功拉到的列表”，供弱网/离线时秒开兜底（每次拉取成功后写入）
+export async function saveLastLists(context: common.Context, nowArr: GameItem[], soonArr: GameItem[]): Promise<void> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    const save: LastLists = { nowArr: nowArr, soonArr: soonArr, at: Date.now() };
+    p.putSync(LAST_LISTS_KEY, JSON.stringify(save));
+    await p.flush();
+  } catch (e) {
+    // 存档失败不阻断主流程
+  }
+}
+
+// 读取“最近一次成功拉到的列表”；无缓存或数据损坏返回 null
+export async function readLastLists(context: common.Context): Promise<LastLists | null> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    const raw = p.getSync(LAST_LISTS_KEY, '') as string;
+    if (raw.length === 0) {
+      return null;
+    }
+    const obj = JSON.parse(raw) as LastLists;
+    if (!(obj.nowArr instanceof Array) || !(obj.soonArr instanceof Array)) {
+      return null;
+    }
+    return obj;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 存档“最近一次成功拉到的手机免费游戏”，供名单源暂缺/弱网时兜底
+export async function saveLastMobile(context: common.Context, mobileArr: GameItem[]): Promise<void> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    p.putSync(LAST_MOBILE_KEY, JSON.stringify(mobileArr));
+    await p.flush();
+  } catch (e) {
+    // 存档失败不阻断主流程
+  }
+}
+
+// 读取“最近一次成功拉到的手机免费游戏”；无缓存或数据损坏返回空数组
+export async function readLastMobile(context: common.Context): Promise<GameItem[]> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    const raw = p.getSync(LAST_MOBILE_KEY, '') as string;
+    if (raw.length === 0) {
+      return [];
+    }
+    const arr = JSON.parse(raw) as GameItem[];
+    return arr instanceof Array ? arr : [];
+  } catch (e) {
+    return [];
   }
 }
 
@@ -432,6 +557,30 @@ export async function saveFabRight(context: common.Context, right: boolean): Pro
   try {
     const p = await preferences.getPreferences(context, { name: FREE_STORE });
     p.putSync(FAB_RIGHT_KEY, right);
+    await p.flush();
+  } catch (e) {
+    // 存档失败不阻断主流程
+  }
+}
+
+// 读取“沉浸光效强度”档位偏好（0=柔和 1=标准 2=增强；默认标准档）
+export async function readGlowLevel(context: common.Context): Promise<number> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    const v = p.getSync(GLOW_KEY, 1) as number;
+    if (v === 0 || v === 1 || v === 2) {
+      return v;
+    }
+  } catch (e) {
+  }
+  return 1;
+}
+
+// 写入“沉浸光效强度”档位偏好
+export async function saveGlowLevel(context: common.Context, level: number): Promise<void> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    p.putSync(GLOW_KEY, level);
     await p.flush();
   } catch (e) {
     // 存档失败不阻断主流程

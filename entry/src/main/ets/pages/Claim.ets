@@ -14,16 +14,8 @@ import {
   ClaimTask,
   markClaimed
 } from '../common/EpicFree';
-
-// ================= 配色（与首页一致的黑底 iOS 风格） =================
-
-const COLOR_BG: string = '#000000';
-const COLOR_TEXT: string = '#FFFFFF';
-const COLOR_SUB: string = '#8E8E93';
-const COLOR_LINE: string = '#2C2C2E';
-const COLOR_ACCENT: string = '#0A59F7';
-const COLOR_OK: string = '#34C759';
-const COLOR_WARN: string = '#FF9500';
+import { appendLog } from '../common/Log';
+import { THEME_FOLLOW, AppPal, appPal } from '../common/Theme';
 
 @Entry
 @Component
@@ -34,8 +26,12 @@ struct Claim {
   @State loginPaused: boolean = false;   // 自动领取时遇到登录要求，等待用户手动登录
   @State okTitles: string[] = [];
   @State failTitles: string[] = [];
-  @State skipOwned: number = 0;          // 判定为“已在库/页面无领取入口”而直接跳过的数量（不尝试领取，也不算失败）
+  @State skipOwned: number = 0;          // 判定为“已在库”而直接跳过的数量（只有真检测到入库文案才算）
   @State diagText: string = '';          // 最近一次判失败时页面上识别到的按钮文字快照，便于排查
+  @State diagLog: string[] = [];         // 每款游戏的判定轨迹日志，便于排查“被跳过/被记为失败”的真实原因
+  // 外观模式：0=跟随系统 1=固定浅色 2=固定深色；页面取色统一走 pal()（浅/深共用一套键名）
+  @StorageLink('themeMode') themeMode: number = THEME_FOLLOW;
+  @StorageProp('sysDark') sysDark: boolean = false;
   @StorageProp('safeTop') topInset: number = 0;
   @StorageProp('safeBottom') bottomInset: number = 0;
 
@@ -48,6 +44,11 @@ struct Claim {
   private timers: number[] = [];
   private stopped: boolean = false;      // 页面离开后停止一切流程
   private lastUrl: string = '';
+
+  // 深浅色当前有效取色板：由外观模式 + 系统真实明暗共同决定
+  private pal(): AppPal {
+    return appPal(this.themeMode, this.sysDark);
+  }
 
   aboutToAppear(): void {
     // 解析路由参数
@@ -144,7 +145,20 @@ struct Claim {
       if (r === null || r === undefined) {
         return 'NONE';
       }
-      return String(r);
+      let s: string = String(r);
+      // runJavaScript 对字符串返回值会做 JSON 序列化（自带双引号），例如返回 '"CLICKED"'；
+      // 这里统一剥掉这层引号，保证后续 === 'CLICKED' / 'OWNED' 等比较成立。
+      if (s.length >= 2 && s.charAt(0) === '"' && s.charAt(s.length - 1) === '"') {
+        try {
+          const parsed = JSON.parse(s) as string;
+          if (typeof parsed === 'string') {
+            s = parsed;
+          }
+        } catch (e) {
+          // 不是合法 JSON 字符串就保留原样
+        }
+      }
+      return s;
     }).catch(() => {
       return 'NONE';
     });
@@ -169,6 +183,7 @@ struct Claim {
         try {
           this.controller.loadUrl(task.url);
         } catch (e) {
+          this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：页面加载异常');
           await this.failPush(task.t);
           this.index = idx + 1;
           continue;
@@ -190,39 +205,50 @@ struct Claim {
         return;
       }
       if (r1 === 'OWNED') {
+        this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：检测到已在库，跳过');
+        this.skipOwned = this.skipOwned + 1;
         this.okPush(task.t);
         this.index = idx + 1;
         continue;
       }
       if (r1 === 'LOGIN') {
+        this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：需要登录，暂停');
         this.pauseLogin(task);
         return;
       }
       if (r1 !== 'CLICKED') {
-        // 页面没有可点“获取”按钮，分两种情况：
-        //  - 页面已显示“在库中” → 直接算成功，跳到下一款（不尝试领取）；
-        //  - 可能是页面渲染慢 → 重载后再探，若仍无任何领取/在库入口 → 按“已在库”跳过，不再反复折腾、不进失败名单。
+        // 没有可点的“获取”按钮：先确认是不是“已在库”，不是则重载后再探一次。
+        // 只有真正检测到入库文案（OWNED）才算“已在库”跳过；否则记为失败，不误标“已领取”。
+        this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：未找到“获取”按钮（返回 ' + r1 + '），复核是否在库');
         const v: string = await this.inject(this.jsVerify());
         if (v === 'LOGIN') {
+          this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：复核时需登录，暂停');
           this.pauseLogin(task);
           return;
         }
         let owned: boolean = v === 'OWNED';
         if (!owned) {
           const r: string = await this.reloadProbe(task);
+          this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：复核结果 verify=' + v + '，重载探针=' + r);
           if (r === 'LOGIN') {
+            this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：重载后需登录，暂停');
             this.pauseLogin(task);
             return;
           }
           if (r === 'OWNED') {
             owned = true;
           }
+        } else {
+          this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：复核结果 verify=' + v);
         }
-        if (!owned) {
+        if (owned) {
+          this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：复核确认已在库，跳过');
           this.skipOwned = this.skipOwned + 1;
+          this.okPush(task.t);
+        } else {
+          this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：未识别到领取入口，也未检测到在库，记为未成功');
+          await this.failPush(task.t);
         }
-        // 已在库 / 页面无领取入口：都记为成功并跳过，避免误报“领取失败”
-        this.okPush(task.t);
         this.index = idx + 1;
         continue;
       }
@@ -241,6 +267,7 @@ struct Claim {
       // 3) 核对是否已入库（两次快速重试，给网站写库留时间）
       let r3: string = await this.inject(this.jsVerify());
       if (r3 === 'LOGIN') {
+        this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：核对时需登录，暂停');
         this.pauseLogin(task);
         return;
       }
@@ -253,7 +280,9 @@ struct Claim {
       }
       if (r3 !== 'OWNED') {
         const rv: string = await this.reloadProbe(task);
+        this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：重载核对 verify=' + r3 + '，重载探针=' + rv);
         if (rv === 'LOGIN') {
+          this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：重载核对时需登录，暂停');
           this.pauseLogin(task);
           return;
         }
@@ -262,11 +291,13 @@ struct Claim {
         }
       }
       if (r3 === 'OWNED') {
+        this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：领取成功（已入库）');
         this.okPush(task.t);
       } else {
-        // 已点过“获取”却始终检测不到“在库中”文案，多为识别盲区而非真失败：按成功记，不再误报失败
-        this.skipOwned = this.skipOwned + 1;
-        this.okPush(task.t);
+        // 已点过“获取”却始终检测不到“在库中”文案：可能是识别盲区，也可能真的没领到。
+        // 如实记为“未成功”，不误标“已领取”，让用户可核对或手动补领。
+        this.log('[' + (idx + 1) + '/' + this.tasks.length + '] ' + task.t + '：已点“获取”但未确认入库，记为未成功');
+        await this.failPush(task.t);
       }
       this.index = idx + 1;
     }
@@ -283,6 +314,19 @@ struct Claim {
       done = done + '，未成功 ' + this.failTitles.length + ' 款（可在库中手动补领）';
     }
     this.curInfo = done;
+  }
+
+  // 追加一条判定轨迹日志（最多保留 40 条，滚动丢弃最早的）
+  private log(line: string): void {
+    const arr: string[] = this.diagLog.slice();
+    arr.push(line);
+    if (arr.length > 40) {
+      arr.splice(0, arr.length - 40);
+    }
+    this.diagLog = arr;
+    // 同步写入持久化运行日志，供设置页“运行日志”查看、复制发给开发者调试
+    appendLog(getContext(this) as common.Context, '自动领取', line).catch(() => {
+    });
   }
 
   // 成功一款：记入本地名单并持久化
@@ -463,7 +507,6 @@ struct Claim {
       return false;
     }
     if(location.hostname.indexOf('accounts.')>=0){ return 'LOGIN'; }
-    if(ownedHit()){ return 'OWNED'; }
     // 收集候选点击元素：直接扫描按钮/链接文字是否含“获取/get/领取”等，
     // 不再依赖 data-testid/aria 前缀（部分语言/卡片按钮没有这些属性，纯靠可见文字）
     var GET=['get','获取','领取','claim','免费'];
@@ -479,7 +522,8 @@ struct Claim {
       if(lower.length<2||lower.length>120){ continue; }
       for(var w=0;w<GET.length;w++){ if(lower.indexOf(GET[w])>=0){ items.push(e); break; } }
     }
-    if(items.length===0){ return 'NONE'; }
+    // 没有“获取”类按钮时才判“已在库”，避免页面上其他游戏卡片带 owned 字样导致误跳过
+    if(items.length===0){ if(ownedHit()){ return 'OWNED'; } return 'NONE'; }
     function inSlug(e){
       var n=e;
       while(n&&n!==document.body){
@@ -599,7 +643,7 @@ struct Claim {
     Row() {
       Text('‹ 返回')
         .fontSize(16)
-        .fontColor(COLOR_ACCENT)
+        .fontColor(this.pal().COLOR_ACCENT)
         .padding({ left: 16, right: 16, top: 8, bottom: 8 })
         .onClick(() => {
           this.leave();
@@ -610,7 +654,7 @@ struct Claim {
       Text(this.mode === 'login' ? 'EPIC 登录' : (this.tasks.length > 0 ? '自动领取' : '免费游戏'))
         .fontSize(17)
         .fontWeight(FontWeight.Medium)
-        .fontColor(COLOR_TEXT)
+        .fontColor(this.pal().COLOR_TEXT)
 
       Blank()
     }
@@ -619,7 +663,7 @@ struct Claim {
       top: this.getUIContext().px2vp(this.topInset) + 4,
       bottom: 4
     })
-    .backgroundColor(COLOR_BG)
+    .backgroundColor(this.pal().COLOR_BG)
   }
 
   @Builder
@@ -627,7 +671,7 @@ struct Claim {
     Column({ space: 6 }) {
       Text(this.curInfo.length > 0 ? this.curInfo : '在此网页中完成操作后点下方“返回”')
         .fontSize(13)
-        .fontColor(COLOR_TEXT)
+        .fontColor(this.pal().COLOR_TEXT)
         .maxLines(2)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .width('100%')
@@ -635,7 +679,7 @@ struct Claim {
       if (this.failTitles.length > 0 && !this.busy && !this.loginPaused) {
         Text('未成功：' + this.failTitles.join('、') + '，可返回后点击卡片重试')
           .fontSize(12)
-          .fontColor(COLOR_WARN)
+          .fontColor(this.pal().COLOR_WARN)
           .maxLines(2)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
@@ -645,37 +689,57 @@ struct Claim {
       if (this.failTitles.length > 0 && this.diagText.length > 0 && !this.busy && !this.loginPaused) {
         Text('当时页面：' + this.diagText)
           .fontSize(11)
-          .fontColor(COLOR_SUB)
+          .fontColor(this.pal().COLOR_SUB)
           .maxLines(3)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
+      }
+
+      // 判定轨迹日志：每款“领取成功 / 已在库跳过 / 未确认”各占一行，最新在最上，便于排查误跳过
+      if (this.diagLog.length > 0) {
+        Column({ space: 2 }) {
+          ForEach(this.diagLog.slice(-8).reverse(), (line: string, index: number) => {
+            Text(line)
+              .fontSize(10)
+              .fontColor(this.pal().COLOR_SUB)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+          }, (line: string, index: number) => index + ':' + line)
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .margin({ top: 2 })
+        .padding(6)
+        .backgroundColor(this.pal().COLOR_TRACK)
+        .borderRadius(6)
       }
 
       if (this.mode === 'auto' && this.tasks.length > 0) {
         Row({ space: 14 }) {
           Text('成功 ' + this.okTitles.length)
             .fontSize(12)
-            .fontColor(COLOR_OK)
+            .fontColor(this.pal().COLOR_OK)
           if (this.skipOwned > 0) {
             Text('已库跳过 ' + this.skipOwned)
               .fontSize(12)
-              .fontColor(COLOR_SUB)
+              .fontColor(this.pal().COLOR_SUB)
           }
           Text('失败 ' + this.failTitles.length)
             .fontSize(12)
-            .fontColor(this.failTitles.length > 0 ? COLOR_WARN : COLOR_SUB)
+            .fontColor(this.failTitles.length > 0 ? this.pal().COLOR_WARN : this.pal().COLOR_SUB)
           Blank()
           Text(this.busy ? '领取中…' : (this.loginPaused ? '已暂停，待登录' : '已结束'))
             .fontSize(12)
-            .fontColor(this.busy ? COLOR_SUB : (this.loginPaused ? COLOR_WARN : COLOR_OK))
+            .fontColor(this.busy ? this.pal().COLOR_SUB : (this.loginPaused ? this.pal().COLOR_WARN : this.pal().COLOR_OK))
         }
         .width('100%')
       }
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 10, bottom: 10 })
-    .backgroundColor(COLOR_BG)
-    .border({ width: { bottom: 1 }, color: COLOR_LINE })
+    .backgroundColor(this.pal().COLOR_BG)
+    .border({ width: { bottom: 1 }, color: this.pal().COLOR_LINE })
   }
 
   @Builder
@@ -684,7 +748,7 @@ struct Claim {
       Row() {
         Text('↻ 刷新')
           .fontSize(14)
-          .fontColor(COLOR_SUB)
+          .fontColor(this.pal().COLOR_SUB)
           .padding({ left: 16, right: 16, top: 10, bottom: 10 })
           .onClick(() => {
             if (this.lastUrl.length > 0) {
@@ -704,7 +768,7 @@ struct Claim {
           .textAlign(TextAlign.Center)
           .width(150)
           .height(38)
-          .backgroundColor(this.loginPaused ? COLOR_OK : COLOR_ACCENT)
+          .backgroundColor(this.loginPaused ? this.pal().COLOR_OK : this.pal().COLOR_ACCENT)
           .borderRadius(19)
           .margin({ right: 16 })
           .onClick(() => {
@@ -716,8 +780,8 @@ struct Claim {
     }
     .width('100%')
     .padding({ bottom: this.getUIContext().px2vp(this.bottomInset) })
-    .backgroundColor(COLOR_BG)
-    .border({ width: { top: 1 }, color: COLOR_LINE })
+    .backgroundColor(this.pal().COLOR_BG)
+    .border({ width: { top: 1 }, color: this.pal().COLOR_LINE })
   }
 
   private bottomLabel(): string {
@@ -756,13 +820,13 @@ struct Claim {
         Row() {
           Text(this.curInfo.length > 0 ? this.curInfo : '请在下方网页中操作')
             .fontSize(13)
-            .fontColor(COLOR_SUB)
+            .fontColor(this.pal().COLOR_SUB)
             .maxLines(2)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 10, bottom: 10 })
-        .border({ width: { bottom: 1 }, color: COLOR_LINE })
+        .border({ width: { bottom: 1 }, color: this.pal().COLOR_LINE })
       }
 
       Web({ src: this.urlInit, controller: this.controller })
@@ -788,6 +852,6 @@ struct Claim {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(COLOR_BG)
+    .backgroundColor(this.pal().COLOR_BG)
   }
 }

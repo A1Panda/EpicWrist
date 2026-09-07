@@ -1,8 +1,10 @@
 import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit';
-import { promptAction, router } from '@kit.ArkUI';
+import { promptAction, router, uiMaterial } from '@kit.ArkUI';
 import { notificationManager } from '@kit.NotificationKit';
 import { workScheduler } from '@kit.BackgroundTasksKit';
 import { motion } from '@kit.MultimodalAwarenessKit';
+import { hdsEffect } from '@kit.UIDesignKit';
+import { THEME_FOLLOW, THEME_LIGHT, THEME_DARK, AppPal, appPal, applyModeAndRefreshChrome } from '../common/Theme';
 import {
   WORK_ID,
   WORK_ABILITY,
@@ -28,31 +30,42 @@ import {
   publishFreeNotice,
   readCalOn,
   saveCalOn,
+  readGlowLevel,
+  saveGlowLevel,
+  readLastLists,
+  saveLastLists,
+  LastLists,
+  readLastMobile,
+  saveLastMobile,
   addFreeToCalendar
 } from '../common/EpicFree';
-import { HistItem, recordFreeNow, readHistoryMerged, backfillHistCovers } from '../common/FreeHistory';
+import { HistItem, recordFreeNow, readHistoryMerged, backfillHistCovers, currentMobileFree } from '../common/FreeHistory';
+import { appendLog } from '../common/Log';
 
-// ================= 配色（通透玻璃拟态：近黑冷底 + 环境光晕 + 半透明磨砂面） =================
+// ================= 配色（系统沉浸光感适配：近黑冷底 + 官方模糊材质层） =================
+// 光效全部走官方方案：卡片/面板=系统模糊材质（backgroundBlurStyle）、悬浮控件=系统材质（systemMaterial）、
+// 按压反馈=官方 hdsEffect；应用内不再手写光晕/辉光/渐变发光。
 
-const COLOR_BG: string = '#05070D';        // 最底近黑，带一丝冷蓝，替代纯黑
-const COLOR_CARD: string = '#1AFFFFFF';    // 磨砂卡片：白 10% 叠加在光晕上，透光不透字
-const COLOR_HAIR: string = '#2BFFFFFF';    // 玻璃描边：白 17%，勾勒“脆边”
-const COLOR_IMG_BG: string = '#111722';    // 图片底：深蓝黑，承载占位首字母
-const COLOR_BADGE: string = '#33FFFFFF';   // “已领取”等中性标记底
-const COLOR_TEXT: string = '#FFFFFF';
-const COLOR_SUB: string = '#8E8E93';
-const COLOR_ACCENT: string = '#0A59F7';
-const COLOR_ACCENT_HI: string = '#2F6DFF'; // 强调高光端（胶囊内选中光晕使用）
-const COLOR_OK: string = '#34C759';
 // 历史页“滑动加载更多”：首次只渲染一页，滑到底部再按此数量追加（避免上千条一次性全部渲染）
 const HIST_PAGE: number = 20;
-// ================= 悬浮胶囊底栏几何（克制不动布局：仅收窄原整宽栏为居中胶囊） =================
-const NAV_W: number = 236;                 // 胶囊总宽
-const NAV_H: number = 56;                  // 胶囊高
-const NAV_EDGE: number = 8;                // 胶囊内边距，让高亮远离圆角
-const NAV_INNER_W: number = NAV_W - NAV_EDGE * 2;  // 内容区宽 220
-const NAV_SEG: number = NAV_INNER_W / 3;           // 每格约 73.3
-const NAV_PILL_W: number = 64;             // 选中高亮块宽
+// 缓存新鲜窗口：EPIC 免费档期每周四才更新，6 小时内成功拉取的数据视为“够新”，
+// 启动时直接展示缓存不自动联网；只有无缓存或缓存过期才启动自动刷新。
+const CACHE_FRESH_MS: number = 6 * 3600 * 1000;
+
+// ================= “沉浸光效强度”三档（0=柔和 1=标准 2=增强，默认标准） =================
+// 各档位同时作用于三处官方光效参数：底部栏/悬浮按钮的系统材质（style+玻璃着色+触点光）、
+// 内容卡片的 hdsEffect 按压点光。数值均取系统材质枚举与官方光效的合法档，不手绘任何光晕。
+const GLOW_SOFT: number = 0;     // 柔和：轻薄玻璃 + 低亮触点光 + 轻按压点光
+const GLOW_NORMAL: number = 1;   // 标准：默认平衡档（保持出厂观感）
+const GLOW_STRONG: number = 2;   // 增强：厚重玻璃 + 高亮触点光 + 强按压点光
+// ================= 底部悬浮 TabBar（官方 Tabs 通道）几何 =================
+// 结构已从“自绘 Stack 胶囊叠在内容区”改为官方 Tabs(barPosition=End) 悬浮底栏：
+// 系统沉浸材质/按压光效只对“底部 TabBar”区域开放，内容区自绘容器永远不会出官方效果。
+// 栏体玻璃、触碰发光、按压形变全部交给 barFloatingStyle.systemMaterial，应用不再自绘胶囊容器。
+const NAV_W: number = 236;                 // 悬浮栏总宽（原胶囊总宽）
+const NAV_H: number = 56;                  // 悬浮栏高（系统默认底栏高 56）
+const NAV_BOTTOM_GAP: number = 12;         // 悬浮栏距屏幕底的空隙（手势条距离额外叠加 bottomInset）
+const NAV_PILL_W: number = 64;             // 选中高亮块宽（单元格内，不再跨格滑位）
 const NAV_PILL_H: number = 38;             // 选中高亮块高
 
 // ================= 历史“按月分组” =================
@@ -97,6 +110,8 @@ function histAlignMonthEnd(list: HistItem[], target: number): number {
 struct Index {
   @State loading: boolean = true;
   @State failed: boolean = false;
+  // 静默刷新进行中（已有内容时拉新不遮全屏，仅右上角给“加载中”反馈）
+  @State refreshing: boolean = false;
   @State nowList: GameItem[] = [];
   @State soonList: GameItem[] = [];
   // EPIC 送过的免费游戏历史（本地累积 + 第三方补全，最新在前）
@@ -114,10 +129,15 @@ struct Index {
   @State curTab: number = 0;
   // 当前被按住的卡片键（用于克制微动效：按压 0.985 微缩），松手清空
   @State pressedKey: string = '';
+  // 外观模式：0=跟随系统 1=固定浅色 2=固定深色（与 common/Theme 保持同一套语义；切换即时全局生效）
+  @StorageLink('themeMode') themeMode: number = THEME_FOLLOW;
+  @StorageProp('sysDark') sysDark: boolean = false;
   // 智感握持开关：true=悬浮按钮跟随握持手左右换角（默认开启）
   @State gripOn: boolean = true;
   // 关闭智感握持时手动固定的按钮位置：true=右下角，false=左下角
   @State manualRight: boolean = true;
+  // 沉浸光效强度档位：0=柔和 1=标准(默认) 2=增强（见顶部 GLOW_* 常量）
+  @State glowLevel: number = GLOW_NORMAL;
   // 悬浮按钮所在下角：右手握持默认右下，智感握持检测到左手后自动切到左下
   @State fabAlign: Alignment = Alignment.BottomEnd;
   private holdOn: boolean = false;
@@ -178,6 +198,8 @@ struct Index {
   }
 
   async initState(): Promise<void> {
+    // 本次启动读到的缓存存档时刻；-1 表示无可用缓存
+    let cacheAt: number = -1;
     try {
       const ctx = getContext(this) as common.Context;
       const seen: string[] = await readSeen(ctx);
@@ -195,12 +217,22 @@ struct Index {
       this.gripOn = grip;
       const right: boolean = await readFabRight(ctx);
       this.manualRight = right;
+      const gl: number = await readGlowLevel(ctx);
+      this.glowLevel = gl;
       const claimed: string[] = await readClaimed(ctx);
       this.claimedTitles = claimed;
       const hist: HistItem[] = await readHistoryMerged(ctx);
       this.histList = hist;
       // 首次只展示约一页（终点对齐到整月，月份标题不会被截断），其余滑动到底部按需追加
       this.histShown = hist.slice(0, histAlignMonthEnd(hist, Math.min(HIST_PAGE, hist.length)));
+      // 弱网兜底：先读“最近一次成功列表”的本地缓存，有货就先铺出秒开
+      const cached: LastLists | null = await readLastLists(ctx);
+      if (cached !== null && (cached.nowArr.length > 0 || cached.soonArr.length > 0)) {
+        this.nowList = cached.nowArr;
+        this.soonList = cached.soonArr;
+        this.loading = false;
+        cacheAt = cached.at;
+      }
     } catch (e) {
     }
     this.prefReady = true;
@@ -211,7 +243,11 @@ struct Index {
     if (this.gripOn) {
       this.startHoldListen();
     }
-    this.load();
+    // 启动联网策略：缓存够新（6 小时内成功拉取）就直接展示、不自动联网——EPIC 每周四才更新，
+    // 重启应用无需每次重新加载；只有无缓存或缓存过期才启动静默刷新（弱网失败也不清空列表）。
+    if (!this.hasAnyList() || cacheAt < 0 || Date.now() - cacheAt > CACHE_FRESH_MS) {
+      this.load();
+    }
   }
 
   onPageShow(): void {
@@ -240,33 +276,86 @@ struct Index {
       return;
     }
     this.inflight = true;
-    this.loading = true;
+    // 已有内容（本地缓存或上次成功结果）时改为“静默刷新”：不遮全屏 Loading、
+    // 失败也不清空当前列表，只置 failed 让标题区给出一行状态提示；
+    // 只有完全没内容可展示时才进入整页加载转圈。
+    if (this.hasAnyList()) {
+      this.refreshing = true;
+    } else {
+      this.loading = true;
+    }
     this.failed = false;
     requestFreeText().then((text: string) => {
-      this.inflight = false;
-      this.apply(text);
-      this.loading = false;
+      this.fetchMobileAndApply(text);
     }).catch(() => {
+      appendLog(getContext(this) as common.Context, '免费列表', 'PC 免费接口请求失败');
       this.inflight = false;
-      this.failed = true;
+      this.refreshing = false;
       this.loading = false;
+      this.failed = true;
     });
   }
 
-  apply(text: string): void {
+  // PC 免费拉取成功后，再取 Android 手机限免（手机“周免”与 PC 周免是两批不同的游戏）。
+  // EPIC 手机接口拦原生 http（Cloudflare 403），改从历史页同源的 josephmate 名单
+  // （platform=android 行）取“当前窗口内”的手机限免；名单无进行中条目时读本地缓存兜底。
+  private fetchMobileAndApply(text: string): void {
+    currentMobileFree(getContext(this) as common.Context).then((mobileArr: GameItem[]) => {
+      if (mobileArr.length > 0) {
+        appendLog(getContext(this) as common.Context, '手机免费', '历史名单解析到 ' + mobileArr.length + ' 款');
+        saveLastMobile(getContext(this) as common.Context, mobileArr);
+        this.apply(text, mobileArr);
+      } else {
+        appendLog(getContext(this) as common.Context, '手机免费', '历史名单无进行中的手机限免，改用本地缓存');
+        this.applyCachedMobile(text);
+      }
+    }).catch(() => {
+      appendLog(getContext(this) as common.Context, '手机免费', '历史名单读取失败，改用本地缓存');
+      this.applyCachedMobile(text);
+    });
+  }
+
+  // 本地手机缓存兜底展示（保存自最近一次名单解析成功）
+  private applyCachedMobile(text: string): void {
+    readLastMobile(getContext(this) as common.Context).then((cached: GameItem[]) => {
+      appendLog(getContext(this) as common.Context, '手机免费', '本地缓存 ' + cached.length + ' 款');
+      this.apply(text, cached);
+    }).catch(() => {
+      appendLog(getContext(this) as common.Context, '手机免费', '本地缓存读取失败，仅展示 PC 免费');
+      this.apply(text, []);
+    });
+  }
+
+  apply(text: string, mobileArr: GameItem[]): void {
     const lists = parseFree(text);
     if (lists === null) {
+      appendLog(getContext(this) as common.Context, '免费列表', 'PC 接口解析失败');
+      this.inflight = false;
+      this.refreshing = false;
+      this.loading = false;
       this.failed = true;
       return;
     }
-    const nowArr: GameItem[] = lists.nowArr;
+    const pcNowArr: GameItem[] = lists.nowArr;
     const soonArr: GameItem[] = lists.soonArr;
-    this.checkNewFree(nowArr);
+    appendLog(getContext(this) as common.Context, '免费列表', 'PC 现在 ' + pcNowArr.length + ' 款 / 即将 ' + soonArr.length + ' 款 / 手机 ' + mobileArr.length + ' 款');
+    // 手机免费游戏并入“现在免费”展示（PC 在前，手机在后；名单无手机限免则仅 PC）
+    const nowArr: GameItem[] = pcNowArr.slice(0);
+    for (let i = 0; i < mobileArr.length; i++) {
+      nowArr.push(mobileArr[i]);
+    }
+    // 判新通知/已见名单只针对 PC 每周免费，手机免费不参与
+    this.checkNewFree(pcNowArr);
     this.nowList = nowArr;
     this.soonList = soonArr;
     this.lastLoad = Date.now();
-    // 历史页数据：把本批“现在免费”并入本地历史（已记录过会自动跳过）
-    this.recordFreeHistory(nowArr);
+    this.inflight = false;
+    this.refreshing = false;
+    this.loading = false;
+    // 成功即回写“最近一次成功列表”缓存，供以后弱网/离线时兜底秒开（写失败不影响主流程）
+    saveLastLists(getContext(this) as common.Context, nowArr, soonArr);
+    // 历史页数据：只把本批 PC“现在免费”并入本地历史（手机免费不入 PC 历史）
+    this.recordFreeHistory(pcNowArr);
     // 自动加入日历开启时：新拉到的“即将免费”顺手写成开领当天的全天日程
     if (this.calOn) {
       this.syncCalToCalendar(true);
@@ -297,6 +386,7 @@ struct Index {
 
   // 点击卡片“去领取/自动领取”：按当前领取方式分发
   // 跳转领取 → 系统浏览器打开领取页；自动领取 → 应用内网页会话逐款代领
+  // （手机限免与 PC 同为 EPIC 账户领取，一并走自动领取脚本）
   private tapClaim(item: GameItem): void {
     if (this.claimAuto) {
       if (this.isClaimed(item.title)) {
@@ -314,6 +404,15 @@ struct Index {
     this.openBrowser(item.claim);
   }
 
+  // 长按“已领取”卡片：强制重新进入自动领取（用于之前被误标为已领取、想重领的情况）
+  private forceClaim(item: GameItem): void {
+    if (item.claim.length === 0) {
+      promptAction.showToast({ message: '暂无可用的领取地址' });
+      return;
+    }
+    const one: ClaimTask = { t: item.title, url: item.claim };
+    this.pushClaimSession([one]);
+  }
   // 跳转领取：调用系统浏览器打开官方领取页
   private openBrowser(url: string): void {
     const ctx = getContext(this) as common.UIAbilityContext;
@@ -333,6 +432,15 @@ struct Index {
       params: { mode: 'login' }
     }).catch(() => {
       promptAction.showToast({ message: '登录页打开失败，请重试' });
+    });
+  }
+
+  // 打开设置页里的“运行日志”查看页
+  private pushLogs(): void {
+    router.pushUrl({
+      url: 'pages/Logs'
+    }).catch(() => {
+      promptAction.showToast({ message: '日志页打开失败，请重试' });
     });
   }
 
@@ -454,6 +562,30 @@ struct Index {
     });
   }
 
+  // 深浅色当前有效取色板：由外观模式 + 系统真实明暗共同决定；主题状态变化会触发本页重绘并整体换色
+  private pal(): AppPal {
+    return appPal(this.themeMode, this.sysDark);
+  }
+
+  // 设置页“外观模式”切换：持久化 + 更新 AppStorage（驱动所有页面取色与系统材质重绘）
+  private setThemeMode(mode: number): void {
+    if (mode === this.themeMode) {
+      return;
+    }
+    applyModeAndRefreshChrome(getContext(this) as common.Context, mode);
+  }
+
+  // 设置页当前外观描述
+  private themeDesc(): string {
+    if (this.themeMode === THEME_LIGHT) {
+      return '固定浅色显示';
+    }
+    if (this.themeMode === THEME_DARK) {
+      return '固定深色显示';
+    }
+    return '跟随系统自动切换明暗';
+  }
+
   // 底部导航切换：进入历史页时给可见窗口补一次封面
   private switchTab(index: number): void {
     this.curTab = index;
@@ -462,9 +594,51 @@ struct Index {
     }
   }
 
-  // 悬浮胶囊底栏：选中高亮块相对“中间格”的横向位移（正中=历史，左=游戏，右=设置）
-  private pillX(): number {
-    return (this.curTab - 1) * NAV_SEG;
+  // 页内容切换动效（纯属性插值，无需额外定时器）：
+  // 每页外层随时按 curTab 计算“静止位”——当前页透明+0 位，非当前页全透明并横向偏离；
+  // 切页瞬间 Tabs 换页后，新页从上一帧的静止位(如 +26vp)插值回 0、旧页反向插值离场，
+  // 位移方向由 (index-curTab) 决定：从左往右切则新页自右侧滑入，反向切则自左侧滑入。
+  private pageAlpha(index: number): number {
+    return this.curTab === index ? 1 : 0;
+  }
+
+  // 非当前页的横向静止偏离量（vp，按与当前页的间距线性放大，最多 52vp 避免跳跃感）
+  private pageOffsetX(index: number): number {
+    if (this.curTab === index) {
+      return 0;
+    }
+    const dist: number = index - this.curTab;
+    const step: number = 26;
+    if (dist > 0) {
+      return Math.min(dist, 2) * step;
+    }
+    return Math.max(dist, -2) * step;
+  }
+
+  // ============ 页面内元素“自顶向下”级联入场（淡入 + 轻微上浮） ============
+  // 每页内按视觉顺序给元素编号 rank：0=页头 1..N=依次往下的小标题/卡片/设置行。
+  // 元素常驻渲染，opacity/y 只按“当前是否在本页”取值；切进本页瞬间各元素从静止位
+  // 依次插值回原位，动画 delay=rank×38ms，形成自上而下的入场波次；切走时 delay=0
+  // 快速淡出，跟随整页退场不拖尾。所有属性变化都走官方 .animation，无自绘光效。
+  private entOpacity(page: number): number {
+    return this.curTab === page ? 1 : 0;
+  }
+
+  // 静止位：非当前页元素整体下移 18vp（恰好移出后即不可见），入场时上浮归位
+  private entRise(page: number): number {
+    return this.curTab === page ? 0 : 18;
+  }
+
+  // 级联动画参数：进入=延时逐级递增；离开=不延时快速淡出。rank 封顶在 8，
+  // 长列表尾部不再无限加长，最多约 300ms 后整体入场完毕。
+  private entAnim(page: number, rank: number): AnimateParam {
+    if (this.curTab !== page) {
+      const out: AnimateParam = { duration: 150, curve: Curve.EaseIn };
+      return out;
+    }
+    const d: number = Math.min(rank, 8) * 38;
+    const inn: AnimateParam = { duration: 360, curve: Curve.FastOutSlowIn, delay: d };
+    return inn;
   }
 
   // 卡片按压微缩放：按住 key 匹配时 0.985，其余 1（克制，不位移不改布局）
@@ -472,15 +646,138 @@ struct Index {
     return this.pressedKey === key ? 0.985 : 1;
   }
 
-  // 悬浮胶囊盖在内容区底部之上：滚动内容需能滚入其下，
-  // 底部预留“胶囊高 + 手势条 + 呼吸间隙”，让最后一项能滚出胶囊可视区。
-  private overlayReserve(): number {
-    return this.getUIContext().px2vp(this.bottomInset) + NAV_H + 26;
+  // 设置页切换“沉浸光效强度”档位：写偏好 → 更新状态（build 重算三处系统材质参数）
+  private setGlow(level: number): void {
+    if (level === this.glowLevel) {
+      return;
+    }
+    this.glowLevel = level;
+    try {
+      saveGlowLevel(getContext(this) as common.Context, level).catch(() => {
+      });
+    } catch (e) {
+    }
   }
 
-  // 自动领取悬浮按钮抬起到底部胶囊上方的底边距
+  // 设置页档位副文案：说明当前档位的光感侧重点
+  private glowDesc(): string {
+    if (this.glowLevel === GLOW_SOFT) {
+      return '轻薄玻璃，触点光与按压光柔和克制';
+    }
+    if (this.glowLevel === GLOW_STRONG) {
+      return '厚重玻璃，触点光与按压光明亮突出';
+    }
+    return '平衡的玻璃厚度与按压光（默认）';
+  }
+
+  // 官方按压光反馈（hdsEffect，来自华为 UIDesignKit，非应用自绘）：
+  // 平时柔和点光，按压时切高亮点光并叠加官方按压阴影；
+  // 强度按“沉浸光效强度”档位取参（柔和/标准/增强），数值只调系统光效的合法档。
+  private immersiveLight(pressed: boolean): VisualEffect {
+    let restColor: string = '#7DFFFFFF';
+    let restIntensity: number = 4;
+    let restBloom: number = 2;
+    let pressColor: string = '#E6FFFFFF';
+    let pressIntensity: number = 10;
+    let pressBloom: number = 5;
+    if (this.glowLevel === GLOW_SOFT) {
+      restColor = '#4DFFFFFF';
+      restIntensity = 2;
+      restBloom = 1;
+      pressColor = '#B3FFFFFF';
+      pressIntensity = 6;
+      pressBloom = 3;
+    } else if (this.glowLevel === GLOW_STRONG) {
+      restColor = '#B3FFFFFF';
+      restIntensity = 7;
+      restBloom = 4;
+      pressColor = '#FFFFFF';
+      pressIntensity = 16;
+      pressBloom = 9;
+    }
+    return new hdsEffect.HdsEffectBuilder()
+      .pressShadow(pressed ? hdsEffect.PressShadowType.BLEND_GRADIENT : hdsEffect.PressShadowType.NONE)
+      .pointLight({
+        sourceType: pressed ? hdsEffect.PointLightSourceType.BRIGHT : hdsEffect.PointLightSourceType.SOFT,
+        illuminatedType: hdsEffect.PointLightIlluminatedType.CONTENT,
+        options: {
+          color: pressed ? pressColor : restColor,
+          intensity: pressed ? pressIntensity : restIntensity,
+          height: 150,
+          bloom: pressed ? pressBloom : restBloom
+        }
+      })
+      .buildEffect();
+  }
+
+  // 悬浮领取按钮的系统材质：按“沉浸光效强度”档位给玻璃厚度/着色/触点光取参。
+  // 柔和=THIN 轻透、标准=REGULAR 出厂、增强=THICK 厚重（三档都是官方 ImmersiveStyle 枚举）。
+  private fabMaterial(): uiMaterial.ImmersiveMaterial {
+    if (this.glowLevel === GLOW_SOFT) {
+      return new uiMaterial.ImmersiveMaterial({
+        style: uiMaterial.ImmersiveStyle.THIN,
+        materialColor: '#660A59F7',
+        interactive: true,
+        lightEffect: { color: '#59FFFFFF' },
+        applyShadow: false
+      });
+    }
+    if (this.glowLevel === GLOW_STRONG) {
+      return new uiMaterial.ImmersiveMaterial({
+        style: uiMaterial.ImmersiveStyle.THICK,
+        materialColor: '#C40A59F7',
+        interactive: true,
+        lightEffect: { color: '#FFFFFF' },
+        applyShadow: false
+      });
+    }
+    return new uiMaterial.ImmersiveMaterial({
+      style: uiMaterial.ImmersiveStyle.REGULAR,
+      materialColor: '#8C0A59F7',
+      interactive: true,
+      lightEffect: { color: '#FFFFFF' },
+      applyShadow: false
+    });
+  }
+
+  // 底部悬浮 TabBar 的系统材质：标准=THIN 保持出厂通透观感，柔和再降触点光亮度，
+  // 增强升到 REGULAR 让玻璃更实、光效层次更明显。
+  private tabMaterial(): uiMaterial.ImmersiveMaterial {
+    if (this.glowLevel === GLOW_SOFT) {
+      return new uiMaterial.ImmersiveMaterial({
+        style: uiMaterial.ImmersiveStyle.THIN,
+        interactive: true,
+        lightEffect: { color: '#59FFFFFF' }
+      });
+    }
+    if (this.glowLevel === GLOW_STRONG) {
+      return new uiMaterial.ImmersiveMaterial({
+        style: uiMaterial.ImmersiveStyle.REGULAR,
+        interactive: true,
+        lightEffect: { color: '#FFFFFF' }
+      });
+    }
+    return new uiMaterial.ImmersiveMaterial({
+      style: uiMaterial.ImmersiveStyle.THIN,
+      interactive: true,
+      lightEffect: { color: '#FFFFFF' }
+    });
+  }
+
+  // 悬浮 TabBar 悬浮在内容区之上：滚动内容需能滚入其下，底部预留
+  // “手势条 + 栏底空隙 + 栏高 + 呼吸间隙”，让最后一项能滚出栏的可视区。
+  private overlayReserve(): number {
+    return this.getUIContext().px2vp(this.bottomInset) + NAV_BOTTOM_GAP + NAV_H + 14;
+  }
+
+  // 自动领取悬浮按钮抬起到底部悬浮 TabBar 上方的底边距
   private fabLiftPad(): number {
-    return this.getUIContext().px2vp(this.bottomInset) + NAV_H + 22;
+    return this.getUIContext().px2vp(this.bottomInset) + NAV_BOTTOM_GAP + NAV_H + 10;
+  }
+
+  // 悬浮 TabBar 的栏底空隙（barFloatingStyle.barBottomMargin，vp）
+  private barBottomPad(): number {
+    return this.getUIContext().px2vp(this.bottomInset) + NAV_BOTTOM_GAP;
   }
 
   // 把 histShown 按“年月”聚合成展示分组（histShown 的终点始终对齐整月，
@@ -530,12 +827,12 @@ struct Index {
   // 历史条目状态颜色
   private histColor(h: HistItem): string {
     if (this.isClaimed(h.t)) {
-      return COLOR_OK;
+      return this.pal().COLOR_OK;
     }
     if (h.endMs > Date.now()) {
-      return COLOR_ACCENT;
+      return this.pal().COLOR_ACCENT;
     }
-    return COLOR_SUB;
+    return this.pal().COLOR_SUB;
   }
 
   // 历史条目展示区间：同一年只显 M月d日，跨年份前缀年份避免歧义
@@ -567,7 +864,7 @@ struct Index {
     this.openBrowser(h.url);
   }
 
-  // 收集“现在免费”中尚未领取成功的游戏，作为批量领取任务
+  // 收集“现在免费”中尚未领取成功的免费游戏，作为批量领取任务（手机限免同样参与）
   private pendingTasks(): ClaimTask[] {
     const tasks: ClaimTask[] = [];
     for (let i = 0; i < this.nowList.length; i++) {
@@ -786,6 +1083,16 @@ struct Index {
 
   // ================= 首页头部 =================
 
+  // 当前是否还有可展示的列表内容（本地缓存或上次成功结果）
+  private hasAnyList(): boolean {
+    return this.nowList.length > 0 || this.soonList.length > 0;
+  }
+
+  // 刷新失败但内容仍在：标题区副标题换一行状态提示（文案等长换色，不增加元素、不挤动布局）
+  private showStale(): boolean {
+    return this.failed && this.hasAnyList();
+  }
+
   @Builder
   Header() {
     Row() {
@@ -793,19 +1100,33 @@ struct Index {
         Text('每周免费游戏')
           .fontSize(22)
           .fontWeight(FontWeight.Medium)
-          .fontColor(COLOR_TEXT)
-        Text('EPIC 商店 · 每周更新')
+          .fontColor(this.pal().COLOR_TEXT)
+        Text(this.showStale() ? '网络异常 · 展示上次内容' : 'EPIC 商店 · 每周更新')
           .fontSize(12)
-          .fontColor(COLOR_SUB)
+          .fontColor(this.showStale() ? this.pal().COLOR_STALE : this.pal().COLOR_SUB)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
       }
       .alignItems(HorizontalAlign.Start)
 
       Blank()
 
-      if (!this.loading) {
+      if (this.loading || this.refreshing) {
+        // 拉取进行中（整页加载或右上角静默刷新）：给出一致的小转圈反馈，避免点了“没反应”
+        Row({ space: 5 }) {
+          LoadingProgress()
+            .width(14)
+            .height(14)
+            .color(this.pal().COLOR_ACCENT)
+          Text('加载中')
+            .fontSize(14)
+            .fontColor(this.pal().COLOR_SUB)
+        }
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+      } else {
         Text(this.failed ? '重试' : '刷新')
           .fontSize(14)
-          .fontColor(COLOR_ACCENT)
+          .fontColor(this.pal().COLOR_ACCENT)
           .padding({ left: 12, right: 12, top: 8, bottom: 8 })
           .onClick(() => {
             this.load();
@@ -820,6 +1141,9 @@ struct Index {
       top: this.getUIContext().px2vp(this.topInset) + 10,
       bottom: 10
     })
+    .opacity(this.entOpacity(0))
+    .translate({ y: this.entRise(0) })
+    .animation(this.entAnim(0, 0))
   }
 
   // ================= 加载 / 结果提示 =================
@@ -830,14 +1154,17 @@ struct Index {
       LoadingProgress()
         .width(46)
         .height(46)
-        .color(COLOR_ACCENT)
+        .color(this.pal().COLOR_ACCENT)
       Text('获取免费游戏列表中…')
         .fontSize(14)
-        .fontColor(COLOR_SUB)
+        .fontColor(this.pal().COLOR_SUB)
     }
     .width('100%')
     .padding({ top: 140, bottom: 140 })
     .justifyContent(FlexAlign.Center)
+    .opacity(this.entOpacity(0))
+    .translate({ y: this.entRise(0) })
+    .animation(this.entAnim(0, 1))
   }
 
   @Builder
@@ -846,18 +1173,21 @@ struct Index {
       Text(main)
         .fontSize(16)
         .fontWeight(FontWeight.Medium)
-        .fontColor(COLOR_TEXT)
+        .fontColor(this.pal().COLOR_TEXT)
       Text(sub)
         .fontSize(13)
-        .fontColor(COLOR_SUB)
+        .fontColor(this.pal().COLOR_SUB)
       Text('点击重试')
         .fontSize(13)
-        .fontColor(COLOR_ACCENT)
+        .fontColor(this.pal().COLOR_ACCENT)
         .margin({ top: 6 })
     }
     .width('100%')
     .padding({ top: 140, bottom: 140 })
     .justifyContent(FlexAlign.Center)
+    .opacity(this.entOpacity(0))
+    .translate({ y: this.entRise(0) })
+    .animation(this.entAnim(0, 1))
     .onClick(() => {
       this.load();
     })
@@ -866,70 +1196,82 @@ struct Index {
   // ================= 游戏列表 =================
 
   @Builder
-  GameCard(item: GameItem) {
-    Row() {
-      if (item.img.length > 0) {
-        Image(item.img)
-          .width(100)
-          .height(62)
-          .borderRadius(10)
-          .objectFit(ImageFit.Cover)
-          .backgroundColor(COLOR_IMG_BG)
-          .margin({ right: 12 })
-      }
+  GameCard(item: GameItem, rank: number) {
+    Stack() {
+      Row() {
+        if (item.img.length > 0) {
+          Image(item.img)
+            .width(100)
+            .height(62)
+            .borderRadius(10)
+            .objectFit(ImageFit.Cover)
+            .backgroundColor(this.pal().COLOR_IMG_BG)
+            .margin({ right: 12 })
+        }
 
-      Column({ space: 4 }) {
-        Text(item.title)
-          .fontSize(16)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(COLOR_TEXT)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Text(item.sub)
-          .fontSize(12)
-          .lineHeight(17)
-          .fontColor(COLOR_SUB)
-          .maxLines(2)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
+        Column({ space: 4 }) {
+          Text(item.title)
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.pal().COLOR_TEXT)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(item.sub)
+            .fontSize(12)
+            .lineHeight(17)
+            .fontColor(this.pal().COLOR_SUB)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
 
-      if (item.claim.length > 0) {
-        if (this.claimAuto && this.isClaimed(item.title)) {
-          // 自动领取模式下已入库：灰底标记，点击重新进入游戏页浏览
-          Text('已领取')
-            .fontSize(12)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(COLOR_SUB)
-            .padding({ left: 14, right: 14, top: 8, bottom: 8 })
-            .backgroundColor(COLOR_BADGE)
-            .borderRadius(16)
-            .margin({ left: 10 })
-            .onClick(() => {
-              this.openBrowser(item.claim);
-            })
-        } else {
-          // 按领取方式显示：跳转=去领取（浏览器），自动=自动领取（应用内脚本）
-          Text(this.claimAuto ? '自动领取' : '去领取')
-            .fontSize(12)
-            .fontWeight(FontWeight.Medium)
-            .fontColor('#FFFFFF')
-            .padding({ left: 14, right: 14, top: 8, bottom: 8 })
-            .backgroundColor(COLOR_ACCENT)
-            .borderRadius(16)
-            .margin({ left: 10 })
-            .onClick(() => {
-              this.tapClaim(item);
-            })
+        if (item.claim.length > 0) {
+          if (this.claimAuto && this.isClaimed(item.title)) {
+            // 自动领取模式下已入库：灰底标记，点击重新进入游戏页浏览，长按强制重新领取
+            Text('已领取')
+              .fontSize(12)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.pal().COLOR_SUB)
+              .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+              .backgroundColor(this.pal().COLOR_BADGE)
+              .borderRadius(16)
+              .margin({ left: 10 })
+              .onClick(() => {
+                this.openBrowser(item.claim);
+              })
+              .gesture(
+                LongPressGesture({ repeat: false })
+                  .onAction(() => {
+                    this.forceClaim(item);
+                  })
+              )
+          } else {
+            // 按领取方式显示：跳转=去领取（浏览器），自动=自动领取（应用内脚本）
+            Text(this.claimAuto ? '自动领取' : '去领取')
+              .fontSize(12)
+              .fontWeight(FontWeight.Medium)
+              .fontColor('#FFFFFF')
+              .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+              .backgroundColor(this.pal().COLOR_ACCENT)
+              .borderRadius(16)
+              .margin({ left: 10 })
+              .onClick(() => {
+                this.tapClaim(item);
+              })
+          }
         }
       }
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 12, bottom: 12 })
     }
     .width('100%')
-    .padding({ left: 12, right: 12, top: 12, bottom: 12 })
-    .backgroundColor(COLOR_CARD)
-    .border({ width: 1, color: COLOR_HAIR })
+    .backgroundColor(this.pal().COLOR_CARD)
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 1, color: this.pal().COLOR_HAIR })
     .borderRadius(16)
+    .clip(true)
+    .visualEffect(this.immersiveLight(this.pressedKey === item.title))
     .onTouch((e: TouchEvent) => {
       if (e.type === TouchType.Down) {
         this.pressedKey = item.title;
@@ -939,6 +1281,10 @@ struct Index {
     })
     .scale({ x: this.pressScale(item.title), y: this.pressScale(item.title) })
     .animation({ duration: 160, curve: Curve.FastOutSlowIn })
+    // 级联入场段：与按压微缩的动画分组独立，互不覆盖
+    .opacity(this.entOpacity(0))
+    .translate({ y: this.entRise(0) })
+    .animation(this.entAnim(0, rank))
   }
 
   @Builder
@@ -950,9 +1296,12 @@ struct Index {
             Text('现在免费')
               .fontSize(16)
               .fontWeight(FontWeight.Medium)
-              .fontColor(COLOR_TEXT)
-            ForEach(this.nowList, (item: GameItem) => {
-              this.GameCard(item)
+              .fontColor(this.pal().COLOR_TEXT)
+              .opacity(this.entOpacity(0))
+              .translate({ y: this.entRise(0) })
+              .animation(this.entAnim(0, 1))
+            ForEach(this.nowList, (item: GameItem, idx: number) => {
+              this.GameCard(item, 2 + idx)
             }, (item: GameItem) => item.title + item.sub)
           }
           .width('100%')
@@ -963,17 +1312,20 @@ struct Index {
             Text('即将免费')
               .fontSize(16)
               .fontWeight(FontWeight.Medium)
-              .fontColor(COLOR_TEXT)
-            ForEach(this.soonList, (item: GameItem) => {
-              this.GameCard(item)
+              .fontColor(this.pal().COLOR_TEXT)
+              .opacity(this.entOpacity(0))
+              .translate({ y: this.entRise(0) })
+              .animation(this.entAnim(0, this.nowList.length > 0 ? this.nowList.length + 2 : 1))
+            ForEach(this.soonList, (item: GameItem, idx: number) => {
+              this.GameCard(item, (this.nowList.length > 0 ? this.nowList.length + 3 : 2) + idx)
             }, (item: GameItem) => item.title + item.sub)
           }
           .width('100%')
         }
       }
       .width('100%')
-      // 胶囊悬浮盖在内容上：滚动区底部按“胶囊高+手势条”预留，让最后一项能滚出胶囊
-      .padding({ left: 16, right: 16, top: 2, bottom: this.claimAuto ? (this.fabLiftPad() + 52) : this.overlayReserve() })
+      // 悬浮胶囊与圆形领取按钮盖在内容上：滚动区底部预留两者高度，让最后一项能滚出按钮
+      .padding({ left: 16, right: 16, top: 2, bottom: this.claimAuto ? (this.fabLiftPad() + 66) : this.overlayReserve() })
     }
     .scrollBar(BarState.Off)
     .align(Alignment.Top)
@@ -983,12 +1335,16 @@ struct Index {
 
   @Builder
   Content() {
-    if (this.loading) {
-      this.LoadingView()
-    } else if (this.failed) {
-      this.TipView('获取失败', '请检查网络连接后重试')
-    } else if (this.nowList.length === 0 && this.soonList.length === 0) {
-      this.TipView('暂无可领免费游戏', '可能本周活动已结束，可稍后再来看看')
+    // 只要已有内容（本地缓存/上次成功结果）就先展示列表，弱网刷新失败也不清空、不遮全屏；
+    // 完全没内容时才退回整页加载 / 失败 / 空态。
+    if (!this.hasAnyList()) {
+      if (this.loading) {
+        this.LoadingView()
+      } else if (this.failed) {
+        this.TipView('获取失败', '请检查网络连接后重试')
+      } else {
+        this.TipView('暂无可领免费游戏', '可能本周活动已结束，可稍后再来看看')
+      }
     } else {
       this.ListPanel()
     }
@@ -1002,10 +1358,10 @@ struct Index {
       Text('历史')
         .fontSize(22)
         .fontWeight(FontWeight.Medium)
-        .fontColor(COLOR_TEXT)
+        .fontColor(this.pal().COLOR_TEXT)
       Text('EPIC 送过的免费游戏 · 共 ' + this.histList.length + ' 期')
         .fontSize(12)
-        .fontColor(COLOR_SUB)
+        .fontColor(this.pal().COLOR_SUB)
     }
     .alignItems(HorizontalAlign.Start)
     .width('100%')
@@ -1015,67 +1371,76 @@ struct Index {
       top: this.getUIContext().px2vp(this.topInset) + 10,
       bottom: 8
     })
+    .opacity(this.entOpacity(1))
+    .translate({ y: this.entRise(1) })
+    .animation(this.entAnim(1, 0))
   }
 
   // 历史单卡：右侧状态用“色字”区分（绿=已领取 蓝=免费中 灰=已结束），不做跳动的标签布局
   @Builder
-  HistoryCard(h: HistItem) {
-    Row() {
-      if (h.img.length > 0) {
-        Image(h.img)
+  HistoryCard(h: HistItem, rank: number) {
+    Stack() {
+      Row() {
+        if (h.img.length > 0) {
+          Image(h.img)
+            .width(100)
+            .height(62)
+            .borderRadius(10)
+            .objectFit(ImageFit.Cover)
+            .backgroundColor(this.pal().COLOR_IMG_BG)
+            .margin({ right: 12 })
+        } else {
+          // 第三方历史源不提供封面图：显示“标题首字母”占位块，保证卡片版式与本地记录一致
+          Column() {
+            Text(h.t.length > 0 ? h.t.charAt(0).toUpperCase() : '?')
+              .fontSize(24)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.pal().COLOR_IMG_FG)
+          }
           .width(100)
           .height(62)
           .borderRadius(10)
-          .objectFit(ImageFit.Cover)
-          .backgroundColor(COLOR_IMG_BG)
+          .backgroundColor(this.pal().COLOR_IMG_BG)
+          .justifyContent(FlexAlign.Center)
           .margin({ right: 12 })
-      } else {
-        // 第三方历史源不提供封面图：显示“标题首字母”占位块，保证卡片版式与本地记录一致
-        Column() {
-          Text(h.t.length > 0 ? h.t.charAt(0).toUpperCase() : '?')
-            .fontSize(24)
-            .fontWeight(FontWeight.Medium)
-            .fontColor('#5A6570')
         }
-        .width(100)
-        .height(62)
-        .borderRadius(10)
-        .backgroundColor(COLOR_IMG_BG)
-        .justifyContent(FlexAlign.Center)
-        .margin({ right: 12 })
-      }
 
-      Column({ space: 4 }) {
-        Row() {
-          Text(h.t)
-            .fontSize(15)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(COLOR_TEXT)
+        Column({ space: 4 }) {
+          Row() {
+            Text(h.t)
+              .fontSize(15)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.pal().COLOR_TEXT)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+            Text(this.histStatus(h))
+              .fontSize(12)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.histColor(h))
+              .margin({ left: 10 })
+          }
+          .width('100%')
+
+          Text(this.histRange(h))
+            .fontSize(12)
+            .fontColor(this.pal().COLOR_SUB)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
-          Text(this.histStatus(h))
-            .fontSize(12)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(this.histColor(h))
-            .margin({ left: 10 })
         }
-        .width('100%')
-
-        Text(this.histRange(h))
-          .fontSize(12)
-          .fontColor(COLOR_SUB)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
       }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 12, bottom: 12 })
     }
     .width('100%')
-    .padding({ left: 12, right: 12, top: 12, bottom: 12 })
-    .backgroundColor(COLOR_CARD)
-    .border({ width: 1, color: COLOR_HAIR })
+    .backgroundColor(this.pal().COLOR_CARD)
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 1, color: this.pal().COLOR_HAIR })
     .borderRadius(16)
+    .clip(true)
+    .visualEffect(this.immersiveLight(this.pressedKey === h.t))
     .onTouch((e: TouchEvent) => {
       if (e.type === TouchType.Down) {
         this.pressedKey = h.t;
@@ -1088,6 +1453,10 @@ struct Index {
     .onClick(() => {
       this.tapHist(h);
     })
+    // 级联入场段：与按压微缩的动画分组独立，互不覆盖
+    .opacity(this.entOpacity(1))
+    .translate({ y: this.entRise(1) })
+    .animation(this.entAnim(1, rank))
   }
 
   @Builder
@@ -1097,27 +1466,33 @@ struct Index {
         Text('还没有历史记录')
           .fontSize(16)
           .fontWeight(FontWeight.Medium)
-          .fontColor(COLOR_TEXT)
+          .fontColor(this.pal().COLOR_TEXT)
         Text('本应用检测到的每期免费游戏会自动记录在这里')
           .fontSize(13)
-          .fontColor(COLOR_SUB)
+          .fontColor(this.pal().COLOR_SUB)
       }
       .width('100%')
       .padding({ top: 140, bottom: 140 })
       .justifyContent(FlexAlign.Center)
+      .opacity(this.entOpacity(1))
+      .translate({ y: this.entRise(1) })
+      .animation(this.entAnim(1, 1))
     } else {
       Scroll() {
         Column({ space: 12 }) {
           // 按月分组：每组 = 月份小标题 + 该月全部卡片（分组整体原子追加）
-          ForEach(this.histGroups(), (g: HistGroup) => {
+          ForEach(this.histGroups(), (g: HistGroup, gi: number) => {
             Column({ space: 10 }) {
               Text(g.label)
                 .fontSize(13)
                 .fontWeight(FontWeight.Medium)
-                .fontColor(COLOR_SUB)
+                .fontColor(this.pal().COLOR_SUB)
                 .width('100%')
-              ForEach(g.items, (h: HistItem) => {
-                this.HistoryCard(h)
+                .opacity(this.entOpacity(1))
+                .translate({ y: this.entRise(1) })
+                .animation(this.entAnim(1, gi * 2 + 1))
+              ForEach(g.items, (h: HistItem, ci: number) => {
+                this.HistoryCard(h, gi * 2 + 2 + ci)
               }, (h: HistItem) => h.t + h.seenMs)
             }
             .width('100%')
@@ -1126,7 +1501,7 @@ struct Index {
           if (this.histShown.length < this.histList.length) {
             Text('上滑加载更多 · 已显示 ' + this.histShown.length + ' / ' + this.histList.length)
               .fontSize(12)
-              .fontColor(COLOR_SUB)
+              .fontColor(this.pal().COLOR_SUB)
               .width('100%')
               .textAlign(TextAlign.Center)
               .padding({ top: 8, bottom: 10 })
@@ -1153,10 +1528,10 @@ struct Index {
       Text('设置')
         .fontSize(22)
         .fontWeight(FontWeight.Medium)
-        .fontColor(COLOR_TEXT)
+        .fontColor(this.pal().COLOR_TEXT)
       Text('管理提醒与领取偏好')
         .fontSize(12)
-        .fontColor(COLOR_SUB)
+        .fontColor(this.pal().COLOR_SUB)
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
     }
@@ -1168,6 +1543,9 @@ struct Index {
       top: this.getUIContext().px2vp(this.topInset) + 10,
       bottom: 4
     })
+    .opacity(this.entOpacity(2))
+    .translate({ y: this.entRise(2) })
+    .animation(this.entAnim(2, 0))
   }
 
   // 设置页分组小标题：与“历史页月份标题”同风格（13sp 次要色），把同类设置归成一组
@@ -1176,7 +1554,7 @@ struct Index {
     Text(title)
       .fontSize(13)
       .fontWeight(FontWeight.Medium)
-      .fontColor(COLOR_SUB)
+      .fontColor(this.pal().COLOR_SUB)
       .width('100%')
       .padding({ top: top, bottom: 8 })
   }
@@ -1188,16 +1566,16 @@ struct Index {
         Text('新免费提醒')
           .fontSize(16)
           .fontWeight(FontWeight.Medium)
-          .fontColor(COLOR_TEXT)
+          .fontColor(this.pal().COLOR_TEXT)
         Text('发现新的免费游戏时推送通知')
           .fontSize(12)
-          .fontColor(COLOR_SUB)
+          .fontColor(this.pal().COLOR_SUB)
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
 
       Toggle({ type: ToggleType.Switch, isOn: this.notifyOn })
-        .selectedColor(COLOR_ACCENT)
+        .selectedColor(this.pal().COLOR_ACCENT)
         .onChange((isOn: boolean) => {
           this.setNotify(isOn);
         })
@@ -1205,8 +1583,9 @@ struct Index {
     .width('100%')
     .padding({ left: 16, right: 16, top: 14, bottom: 14 })
     .margin({ top: 8 })
-    .backgroundColor(COLOR_CARD)
-    .border({ width: 1, color: COLOR_HAIR })
+    .backgroundColor(this.pal().COLOR_CARD)
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 1, color: this.pal().COLOR_HAIR })
     .borderRadius(16)
     .onTouch((e: TouchEvent) => {
       if (e.type === TouchType.Down) {
@@ -1227,16 +1606,16 @@ struct Index {
         Text('加入日历提醒')
           .fontSize(16)
           .fontWeight(FontWeight.Medium)
-          .fontColor(COLOR_TEXT)
+          .fontColor(this.pal().COLOR_TEXT)
         Text('把“即将免费”的开领日写为当天全天日程并提醒')
           .fontSize(12)
-          .fontColor(COLOR_SUB)
+          .fontColor(this.pal().COLOR_SUB)
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
 
       Toggle({ type: ToggleType.Switch, isOn: this.calOn })
-        .selectedColor(COLOR_ACCENT)
+        .selectedColor(this.pal().COLOR_ACCENT)
         .onChange((isOn: boolean) => {
           this.setCal(isOn);
         })
@@ -1244,8 +1623,9 @@ struct Index {
     .width('100%')
     .padding({ left: 16, right: 16, top: 14, bottom: 14 })
     .margin({ top: 8 })
-    .backgroundColor(COLOR_CARD)
-    .border({ width: 1, color: COLOR_HAIR })
+    .backgroundColor(this.pal().COLOR_CARD)
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 1, color: this.pal().COLOR_HAIR })
     .borderRadius(16)
     .onTouch((e: TouchEvent) => {
       if (e.type === TouchType.Down) {
@@ -1264,11 +1644,11 @@ struct Index {
     Text(label)
       .fontSize(14)
       .fontWeight(this.manualRight === right ? FontWeight.Medium : FontWeight.Normal)
-      .fontColor(this.manualRight === right ? '#FFFFFF' : COLOR_SUB)
+      .fontColor(this.manualRight === right ? '#FFFFFF' : this.pal().COLOR_SUB)
       .textAlign(TextAlign.Center)
       .width('50%')
       .height('100%')
-      .backgroundColor(this.manualRight === right ? COLOR_ACCENT : Color.Transparent)
+      .backgroundColor(this.manualRight === right ? this.pal().COLOR_ACCENT : Color.Transparent)
       .borderRadius(8)
       .onClick(() => {
         this.setFabSide(right);
@@ -1284,16 +1664,16 @@ struct Index {
           Text('智感握持')
             .fontSize(16)
             .fontWeight(FontWeight.Medium)
-            .fontColor(COLOR_TEXT)
+            .fontColor(this.pal().COLOR_TEXT)
           Text(this.gripOn ? '“开始自动领取”按钮自动跟随左右手握持换角' : '已关闭自动跟随：手动选择按钮固定位置')
             .fontSize(12)
-            .fontColor(COLOR_SUB)
+            .fontColor(this.pal().COLOR_SUB)
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
 
         Toggle({ type: ToggleType.Switch, isOn: this.gripOn })
-          .selectedColor(COLOR_ACCENT)
+          .selectedColor(this.pal().COLOR_ACCENT)
           .onChange((isOn: boolean) => {
             this.setGrip(isOn);
           })
@@ -1309,15 +1689,16 @@ struct Index {
         .width('100%')
         .height(38)
         .padding(3)
-        .backgroundColor('#111114')
+        .backgroundColor(this.pal().COLOR_TRACK)
         .borderRadius(10)
       }
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 14, bottom: 14 })
     .margin({ top: 8 })
-    .backgroundColor(COLOR_CARD)
-    .border({ width: 1, color: COLOR_HAIR })
+    .backgroundColor(this.pal().COLOR_CARD)
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 1, color: this.pal().COLOR_HAIR })
     .borderRadius(16)
     .alignItems(HorizontalAlign.Start)
     .onTouch((e: TouchEvent) => {
@@ -1337,11 +1718,11 @@ struct Index {
     Text(label)
       .fontSize(14)
       .fontWeight(this.claimAuto === mode ? FontWeight.Medium : FontWeight.Normal)
-      .fontColor(this.claimAuto === mode ? '#FFFFFF' : COLOR_SUB)
+      .fontColor(this.claimAuto === mode ? '#FFFFFF' : this.pal().COLOR_SUB)
       .textAlign(TextAlign.Center)
       .width('50%')
       .height('100%')
-      .backgroundColor(this.claimAuto === mode ? COLOR_ACCENT : Color.Transparent)
+      .backgroundColor(this.claimAuto === mode ? this.pal().COLOR_ACCENT : Color.Transparent)
       .borderRadius(8)
       .onClick(() => {
         this.setClaimMode(mode);
@@ -1354,7 +1735,7 @@ struct Index {
       // 当前领取方式说明（方式名称已由分组标题给出，这里只描述对应行为）
       Text(this.claimAuto ? '开启后回到游戏页，点悬浮按钮批量代领' : '点击卡片用系统浏览器打开领取页')
         .fontSize(12)
-        .fontColor(COLOR_SUB)
+        .fontColor(this.pal().COLOR_SUB)
         .width('100%')
 
       // 跳转领取 / 自动领取 二选一切换
@@ -1365,7 +1746,7 @@ struct Index {
       .width('100%')
       .height(38)
       .padding(3)
-      .backgroundColor('#111114')
+      .backgroundColor(this.pal().COLOR_TRACK)
       .borderRadius(10)
 
       if (this.claimAuto) {
@@ -1375,10 +1756,10 @@ struct Index {
             Text('EPIC 账户登录')
               .fontSize(15)
               .fontWeight(FontWeight.Medium)
-              .fontColor(COLOR_TEXT)
+              .fontColor(this.pal().COLOR_TEXT)
             Text('自动领取需在应用内登录一次，登录态会保留')
               .fontSize(12)
-              .fontColor(COLOR_SUB)
+              .fontColor(this.pal().COLOR_SUB)
           }
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
@@ -1386,7 +1767,7 @@ struct Index {
           Text('去登录')
             .fontSize(13)
             .fontWeight(FontWeight.Medium)
-            .fontColor(COLOR_ACCENT)
+            .fontColor(this.pal().COLOR_ACCENT)
         }
         .width('100%')
         .padding({ top: 4, bottom: 4 })
@@ -1407,188 +1788,467 @@ struct Index {
     .width('100%')
     .padding({ left: 16, right: 16, top: 14, bottom: 14 })
     .margin({ top: 8 })
-    .backgroundColor(COLOR_CARD)
-    .border({ width: 1, color: COLOR_HAIR })
+    .backgroundColor(this.pal().COLOR_CARD)
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 1, color: this.pal().COLOR_HAIR })
     .borderRadius(16)
     .alignItems(HorizontalAlign.Start)
   }
 
-  // ================= 底部悬浮胶囊导航 =================
-
+  // 设置页“运行日志”入口行：打开日志查看页，可复制全部日志发给开发者调试
   @Builder
-  TabItem(label: string, index: number) {
-    Column() {
-      Text(label)
+  LogRow() {
+    Row() {
+      Column({ space: 4 }) {
+        Text('运行日志')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.pal().COLOR_TEXT)
+        Text('查看领取与列表抓取的运行记录，可复制发给开发者')
+          .fontSize(12)
+          .fontColor(this.pal().COLOR_SUB)
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      Text('查看')
         .fontSize(13)
-        .fontWeight(this.curTab === index ? FontWeight.Medium : FontWeight.Normal)
-        .fontColor(this.curTab === index ? COLOR_TEXT : COLOR_SUB)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.pal().COLOR_ACCENT)
     }
-    .layoutWeight(1)
-    .height('100%')
-    .justifyContent(FlexAlign.Center)
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+    .margin({ top: 8 })
+    .backgroundColor(this.pal().COLOR_CARD)
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 1, color: this.pal().COLOR_HAIR })
+    .borderRadius(16)
+    .onTouch((e: TouchEvent) => {
+      if (e.type === TouchType.Down) {
+        this.pressedKey = 'SetLogs';
+      } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.pressedKey === 'SetLogs') {
+        this.pressedKey = '';
+      }
+    })
+    .scale({ x: this.pressScale('SetLogs'), y: this.pressScale('SetLogs') })
+    .animation({ duration: 160, curve: Curve.FastOutSlowIn })
     .onClick(() => {
-      this.switchTab(index);
+      this.pushLogs();
     })
   }
 
-  // 悬浮玻璃胶囊本体：内层是“选中高亮块 + 三个等分点击格”。
-  // 高亮默认被 Stack 居中在“历史”格，translate 依 curTab 平滑左右滑位（克制动效、无跳动）。
+  // ================= 底部悬浮 TabBar 的页签单元 =================
+  // 结构上使用官方 Tabs(barPosition=End)+barFloatingStyle 悬浮底栏（沉浸光感唯一官方生效区）：
+  // 栏体玻璃/触碰发光/按压形变由系统材质统一呈现；这里只画“选中高亮块 + 文字”两个状态，
+  // 不写任何按压光/阴影（避免与系统材质叠加串色或遮挡官方光效）。
   @Builder
-  NavCapsule() {
+  NavCell(label: string, index: number) {
     Stack({ alignContent: Alignment.Center }) {
-      Column()
-        .width(NAV_PILL_W)
-        .height(NAV_PILL_H)
-        .borderRadius(NAV_PILL_H / 2)
-        .linearGradient({ angle: 90, colors: [[COLOR_ACCENT, 0.0], [COLOR_ACCENT_HI, 1.0]] })
-        .shadow({ radius: 12, color: '#590A59F7', offsetY: 4 })
-        .translate({ x: this.pillX() })
-        .animation({ duration: 300, curve: Curve.FastOutSlowIn })
-
-      Row() {
-        this.TabItem('游戏', 0)
-        this.TabItem('历史', 1)
-        this.TabItem('设置', 2)
+      if (this.curTab === index) {
+        Column()
+          .width(NAV_PILL_W)
+          .height(NAV_PILL_H)
+          .borderRadius(NAV_PILL_H / 2)
+          // 选中高亮：系统蓝纯色块。进场=0.72→1 缩放淡入（轻“弹”），离场=纯淡出，
+          // 让高亮在页签间“换位”而非生硬闪变（跨格滑位已取消，内容翻页由页面层动效接管）
+          .backgroundColor(this.pal().COLOR_ACCENT)
+          .transition(TransitionEffect.asymmetric(
+            TransitionEffect.OPACITY.animation({ duration: 220, curve: Curve.FastOutSlowIn })
+              .combine(TransitionEffect.scale({ x: 0.72, y: 0.72 })
+                .animation({ duration: 220, curve: Curve.FastOutSlowIn })),
+            TransitionEffect.OPACITY.animation({ duration: 150, curve: Curve.EaseIn })
+          ))
       }
-      .width('100%')
-      .height('100%')
-    }
-    .width(NAV_W)
-    .height(NAV_H)
-    .padding({ left: NAV_EDGE, right: NAV_EDGE })
-    .borderRadius(NAV_H / 2)
-    .backgroundBlurStyle(BlurStyle.Thin)
-    .border({ width: 1, color: COLOR_HAIR })
-    .shadow({ radius: 26, color: '#40050A14', offsetY: 10 })
-  }
-
-  // ================= 沉浸光感背景 =================
-  // 三层全屏渐变叠加：基色冷黑 + 右上主蓝光 + 左下紫光，
-  // 磨砂面/悬浮胶囊的 blur 才有“背后有光”的玻璃感。
-
-  @Builder
-  GlowBackdrop() {
-    Stack() {
-      Column()
-        .width('100%')
-        .height('100%')
-        .linearGradient({
-          angle: 180,
-          colors: [['#111D33', 0.0], ['#070C16', 0.55], ['#04060C', 1.0]]
-        })
-      Column()
-        .width('100%')
-        .height('100%')
-        .radialGradient({
-          center: ['80%', '-4%'],
-          radius: '92%',
-          colors: [['#4A0A59F7', 0.0], ['#1A0A59F7', 0.42], ['#000A59F7', 1.0]]
-        })
-      Column()
-        .width('100%')
-        .height('100%')
-        .radialGradient({
-          center: ['6%', '116%'],
-          radius: '95%',
-          colors: [['#384A3AF0', 0.0], ['#124A3AF0', 0.5], ['#004A3AF0', 1.0]]
-        })
+      Text(label)
+        .fontSize(13)
+        .fontWeight(this.curTab === index ? FontWeight.Medium : FontWeight.Normal)
+        .fontColor(this.curTab === index ? '#FFFFFF' : this.pal().COLOR_SUB)
+        .animation({ duration: 220, curve: Curve.FastOutSlowIn })
     }
     .width('100%')
     .height('100%')
+  }
+
+  // ================= 背景与沉浸光感说明 =================
+  // 页面背景即最外层 .backgroundColor(this.pal().COLOR_BG) 纯近黑底色，不再绘制任何自绘光晕；
+  // 玻璃观感与光感全部由官方能力承担：卡片背景模糊、悬浮控件系统材质、按压官方光效。
+
+  // 设置页“外观模式”：浅色 / 深色 / 跟随系统 三段切换（样式与其他设置卡一致）
+  @Builder
+  ThemeRow() {
+    Column({ space: 10 }) {
+      Row() {
+        Text('外观模式')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.pal().COLOR_TEXT)
+        Blank()
+        Text(this.themeDesc())
+          .fontSize(12)
+          .fontColor(this.pal().COLOR_SUB)
+          .margin({ left: 10 })
+      }
+      .width('100%')
+
+      Row({ space: 4 }) {
+        this.ThemeSeg('浅色', THEME_LIGHT)
+        this.ThemeSeg('深色', THEME_DARK)
+        this.ThemeSeg('跟随系统', THEME_FOLLOW)
+      }
+      .width('100%')
+      .height(38)
+      .padding(3)
+      .backgroundColor(this.pal().COLOR_TRACK)
+      .borderRadius(10)
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+    .margin({ top: 8 })
+    .backgroundColor(this.pal().COLOR_CARD)
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 1, color: this.pal().COLOR_HAIR })
+    .borderRadius(16)
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  // “外观模式”分段单项：选中=系统蓝底白字，未选=透明底灰字
+  @Builder
+  ThemeSeg(label: string, mode: number) {
+    Text(label)
+      .fontSize(13)
+      .fontWeight(this.themeMode === mode ? FontWeight.Medium : FontWeight.Normal)
+      .fontColor(this.themeMode === mode ? '#FFFFFF' : this.pal().COLOR_SUB)
+      .textAlign(TextAlign.Center)
+      .layoutWeight(1)
+      .height('100%')
+      .backgroundColor(this.themeMode === mode ? this.pal().COLOR_ACCENT : Color.Transparent)
+      .borderRadius(8)
+      .onClick(() => {
+        this.setThemeMode(mode);
+      })
+  }
+
+  // “沉浸光效强度”分段行：柔和/标准/增强三档，切换即改系统材质与按压光的取参
+  @Builder
+  GlowRow() {
+    Column({ space: 10 }) {
+      Column({ space: 4 }) {
+        Text('沉浸光效强度')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.pal().COLOR_TEXT)
+        Text(this.glowDesc())
+          .fontSize(12)
+          .lineHeight(17)
+          .fontColor(this.pal().COLOR_SUB)
+      }
+      .alignItems(HorizontalAlign.Start)
+      .width('100%')
+
+      Row({ space: 4 }) {
+        this.GlowSeg('柔和', GLOW_SOFT)
+        this.GlowSeg('标准', GLOW_NORMAL)
+        this.GlowSeg('增强', GLOW_STRONG)
+      }
+      .width('100%')
+      .height(38)
+      .padding(3)
+      .backgroundColor(this.pal().COLOR_TRACK)
+      .borderRadius(10)
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+    .margin({ top: 8 })
+    .backgroundColor(this.pal().COLOR_CARD)
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 1, color: this.pal().COLOR_HAIR })
+    .borderRadius(16)
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  // “沉浸光效强度”分段单项：选中=系统蓝底白字，未选=透明底灰字
+  @Builder
+  GlowSeg(label: string, level: number) {
+    Text(label)
+      .fontSize(13)
+      .fontWeight(this.glowLevel === level ? FontWeight.Medium : FontWeight.Normal)
+      .fontColor(this.glowLevel === level ? '#FFFFFF' : this.pal().COLOR_SUB)
+      .textAlign(TextAlign.Center)
+      .layoutWeight(1)
+      .height('100%')
+      .backgroundColor(this.glowLevel === level ? this.pal().COLOR_ACCENT : Color.Transparent)
+      .borderRadius(8)
+      .onClick(() => {
+        this.setGlow(level);
+      })
+  }
+
+  // 设置页说明卡：光效材质由系统沉浸材质统一呈现，应用内档位只调强度取参。
+  @Builder
+  ImmersiveInfoRow() {
+    Row() {
+      Column({ space: 4 }) {
+        Text('沉浸光感')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.pal().COLOR_TEXT)
+        Text('玻璃、按压流光与形变均由系统沉浸材质统一呈现，强度按上方档位生效')
+          .fontSize(12)
+          .lineHeight(17)
+          .fontColor(this.pal().COLOR_SUB)
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      Text('系统材质')
+        .fontSize(12)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.pal().COLOR_ACCENT)
+        .margin({ left: 10 })
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+    .margin({ top: 8 })
+    .backgroundColor(this.pal().COLOR_CARD)
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 1, color: this.pal().COLOR_HAIR })
+    .borderRadius(16)
   }
 
   build() {
-    // 最外层 Stack（底对齐）：光晕铺底 → 全屏内容 → 悬浮胶囊盖在最上层
-    Stack({ alignContent: Alignment.Bottom }) {
-      this.GlowBackdrop()
-
-      // 三页内容占满全屏、可滚到胶囊下方被其覆盖，形成“底部导航悬浮于内容之上”的沉浸效果
+    // ================= 沉浸光感 = 官方生效区（结构性关键） =================
+    // 系统沉浸材质只对两类位置开放：Navigation/NavDestination 标题栏，以及
+    // “横排 Tabs + barPosition=End”的底部 TabBar。内容区里自绘的容器无论参数怎么配
+    // 都不会出现官方按压发光/形变——这正是此前“怎么调都没效果”的根因。
+    // 本版把导航换成官方 Tabs 悬浮底栏：玻璃/触碰发光/按压形变交给
+    // barFloatingStyle.systemMaterial（interactive + lightEffect 白触点光），
+    // 应用只保留选中高亮与内容页面，不再自绘胶囊容器。
+    Stack() {
+      // 三页内容（官方 Tabs 悬浮底栏自带沉浸光感）+ 悬浮领取按钮 overlay
       Stack({ alignContent: this.fabAlign }) {
-        // 页 1：游戏列表（常驻组件树，仅切换显隐，保留滚动位置）
-        Column() {
-          this.Header()
-          this.Content()
-        }
-        .width('100%')
-        .height('100%')
-        .visibility(this.curTab === 0 ? Visibility.Visible : Visibility.None)
-
-        // 页 2：历史（常驻组件树，仅切换显隐）
-        Column() {
-          this.HistoryHeader()
-          this.HistoryView()
-        }
-        .width('100%')
-        .height('100%')
-        .visibility(this.curTab === 1 ? Visibility.Visible : Visibility.None)
-
-        // 页 3：设置
-        Column() {
-          this.SettingsHeader()
-          Scroll() {
-            // 统一内容边距；设置项按“语义分组 + 小标题”排布
+        Tabs({ barPosition: BarPosition.End, index: this.curTab }) {
+          // 页 1：游戏列表（Tabs 保持各页常驻，滚动位置不丢失）
+          TabContent() {
             Column() {
-              this.SettingsGroupTitle('提醒与通知', 2)
-              this.NotifyRow()
-              this.CalRow()
-
-              this.SettingsGroupTitle('领取方式', 24)
-              this.ClaimModeCard()
-
-              // 智感握持只作用于自动领取模式的悬浮按钮，自动领取开启时才展示该组
-              if (this.claimAuto) {
-                this.SettingsGroupTitle('悬浮按钮', 24)
-                this.GripRow()
-              }
+              this.Header()
+              this.Content()
             }
             .width('100%')
-            .padding({ left: 16, right: 16, bottom: this.overlayReserve() })
+            .height('100%')
+            .opacity(this.pageAlpha(0))
+            .translate({ x: this.pageOffsetX(0) })
+            .animation({ duration: 300, curve: Curve.FastOutSlowIn })
           }
-          .scrollBar(BarState.Off)
-          .align(Alignment.Top)
-          .width('100%')
-          .layoutWeight(1)
+          .tabBar(this.NavCell('游戏', 0))
+
+          // 页 2：历史
+          TabContent() {
+            Column() {
+              this.HistoryHeader()
+              this.HistoryView()
+            }
+            .width('100%')
+            .height('100%')
+            .opacity(this.pageAlpha(1))
+            .translate({ x: this.pageOffsetX(1) })
+            .animation({ duration: 300, curve: Curve.FastOutSlowIn })
+          }
+          .tabBar(this.NavCell('历史', 1))
+
+          // 页 3：设置
+          TabContent() {
+            Column() {
+              this.SettingsHeader()
+              Scroll() {
+                // 统一内容边距；设置项按“语义分组 + 小标题”排布。
+                // 每个条目用透明包装列承载级联入场动画（rank 从上到下递增），不影响布局与点击。
+                Column() {
+                  Column() {
+                    this.SettingsGroupTitle('视觉与光效', 2)
+                  }
+                  .width('100%')
+                  .opacity(this.entOpacity(2))
+                  .translate({ y: this.entRise(2) })
+                  .animation(this.entAnim(2, 1))
+                  Column() {
+                    this.ThemeRow()
+                  }
+                  .width('100%')
+                  .opacity(this.entOpacity(2))
+                  .translate({ y: this.entRise(2) })
+                  .animation(this.entAnim(2, 2))
+                  Column() {
+                    this.GlowRow()
+                  }
+                  .width('100%')
+                  .opacity(this.entOpacity(2))
+                  .translate({ y: this.entRise(2) })
+                  .animation(this.entAnim(2, 3))
+                  Column() {
+                    this.ImmersiveInfoRow()
+                  }
+                  .width('100%')
+                  .opacity(this.entOpacity(2))
+                  .translate({ y: this.entRise(2) })
+                  .animation(this.entAnim(2, 4))
+
+                  Column() {
+                    this.SettingsGroupTitle('提醒与通知', 24)
+                  }
+                  .width('100%')
+                  .opacity(this.entOpacity(2))
+                  .translate({ y: this.entRise(2) })
+                  .animation(this.entAnim(2, 5))
+                  Column() {
+                    this.NotifyRow()
+                  }
+                  .width('100%')
+                  .opacity(this.entOpacity(2))
+                  .translate({ y: this.entRise(2) })
+                  .animation(this.entAnim(2, 6))
+                  Column() {
+                    this.CalRow()
+                  }
+                  .width('100%')
+                  .opacity(this.entOpacity(2))
+                  .translate({ y: this.entRise(2) })
+                  .animation(this.entAnim(2, 7))
+
+                  Column() {
+                    this.SettingsGroupTitle('领取方式', 24)
+                  }
+                  .width('100%')
+                  .opacity(this.entOpacity(2))
+                  .translate({ y: this.entRise(2) })
+                  .animation(this.entAnim(2, 8))
+                  Column() {
+                    this.ClaimModeCard()
+                  }
+                  .width('100%')
+                  .opacity(this.entOpacity(2))
+                  .translate({ y: this.entRise(2) })
+                  .animation(this.entAnim(2, 9))
+
+                  // 智感握持只作用于自动领取模式的悬浮按钮，自动领取开启时才展示该组
+                  if (this.claimAuto) {
+                    Column() {
+                      this.SettingsGroupTitle('悬浮按钮', 24)
+                    }
+                    .width('100%')
+                    .opacity(this.entOpacity(2))
+                    .translate({ y: this.entRise(2) })
+                    .animation(this.entAnim(2, 10))
+                    Column() {
+                      this.GripRow()
+                    }
+                    .width('100%')
+                    .opacity(this.entOpacity(2))
+                    .translate({ y: this.entRise(2) })
+                    .animation(this.entAnim(2, 11))
+                  }
+
+                  Column() {
+                    this.SettingsGroupTitle('调试与帮助', 24)
+                  }
+                  .width('100%')
+                  .opacity(this.entOpacity(2))
+                  .translate({ y: this.entRise(2) })
+                  .animation(this.entAnim(2, 12))
+                  Column() {
+                    this.LogRow()
+                  }
+                  .width('100%')
+                  .opacity(this.entOpacity(2))
+                  .translate({ y: this.entRise(2) })
+                  .animation(this.entAnim(2, 13))
+                }
+                .width('100%')
+                .padding({ left: 16, right: 16, bottom: this.overlayReserve() })
+              }
+              .scrollBar(BarState.Off)
+              .align(Alignment.Top)
+              .width('100%')
+              .layoutWeight(1)
+            }
+            .width('100%')
+            .height('100%')
+            .opacity(this.pageAlpha(2))
+            .translate({ x: this.pageOffsetX(2) })
+            .animation({ duration: 300, curve: Curve.FastOutSlowIn })
+          }
+          .tabBar(this.NavCell('设置', 2))
         }
+        .vertical(false)
+        .scrollable(false)
+        .barMode(BarMode.Fixed)
+        .barHeight(NAV_H)
+        .barOverlap(true)
+        // 点页签/改 index 时由 Tabs 官方通道做内容横向滑切（BottomTabBar 默认 0 需显式开启）；
+        // 页面层另有淡入+轻微错位动效叠加，方向一致、互为增强。
+        .animationDuration(300)
+        .barFloatingStyle({
+          // 收窄成居中悬浮胶囊宽；与旧几何一致
+          barWidth: {
+            smallBarWidth: NAV_W,
+            mediumBarWidth: NAV_W,
+            largeBarWidth: NAV_W
+          },
+          barBottomMargin: this.barBottomPad(),
+          adaptToHandedness: false,
+          // 官方沉浸材质（API 26）：玻璃=THIN 起步、形变=interactive、触点光=lightEffect；
+          // style 与触点光跟随“沉浸光效强度”档位（tabMaterial 取参），标准档即出厂 THIN 观感。
+          // 栏体边框/阴影由材质统一管理，不在应用侧手写，避免串色/阴影失效。
+          systemMaterial: this.tabMaterial()
+        })
+        .onChange((index: number) => {
+          this.switchTab(index);
+        })
         .width('100%')
         .height('100%')
-        .visibility(this.curTab === 2 ? Visibility.Visible : Visibility.None)
 
-        // 悬浮按钮：仅自动领取模式 + 游戏页 + 列表就绪时展示；点击手动开始批量领取
+        // 悬浮领取按钮：仅自动领取模式 + 游戏页 + 列表就绪时展示；点击手动开始批量领取
         if (this.curTab === 0 && this.claimAuto && !this.loading && !this.failed &&
           (this.nowList.length > 0 || this.soonList.length > 0)) {
-          Text('开始自动领取')
-            .fontSize(14)
-            .fontWeight(FontWeight.Medium)
-            .fontColor('#FFFFFF')
-            .padding({ left: 18, right: 18, top: 11, bottom: 11 })
-            .backgroundColor(COLOR_ACCENT)
-            .borderRadius(22)
-            .shadow({ radius: 14, color: '#660A59F7', offsetY: 5 })
-            // 跟手对齐：贴在右下给右边距，贴在左下给左边距；整体抬升到底部悬浮胶囊之上
-            .margin({
-              left: this.fabAlign === Alignment.BottomStart ? 16 : 0,
-              right: this.fabAlign === Alignment.BottomEnd ? 16 : 0,
-              bottom: this.fabLiftPad()
-            })
-            .onClick(() => {
-              this.startAutoClaim();
-            })
+          Stack() {
+            Image($r('app.media.ic_gift'))
+              .width(30)
+              .height(30)
+              .objectFit(ImageFit.Contain)
+          }
+          .width(58)
+          .height(58)
+          .borderRadius(29)
+          // 官方沉浸式系统材质（API 26）：品牌蓝半透明玻璃 + 按压形变 + 白色触点光；
+          // 玻璃厚度/触点光亮度跟随“沉浸光效强度”档位（fabMaterial 取参）
+          .systemMaterial(this.fabMaterial())
+          // 中性环境投影：仅抬升悬浮层次，不含彩色辉光（光感由系统材质统一呈现）
+          .shadow({ radius: 18, color: '#40050A14', offsetY: 6 })
+          .scale({ x: this.pressScale('__fab__'), y: this.pressScale('__fab__') })
+          .animation({ duration: 160, curve: Curve.FastOutSlowIn })
+          // 跟手对齐：右下角给右边距、左下角给左边距；整体抬升到底部悬浮 TabBar 之上
+          .margin({
+            left: this.fabAlign === Alignment.BottomStart ? 20 : 0,
+            right: this.fabAlign === Alignment.BottomEnd ? 20 : 0,
+            bottom: this.fabLiftPad()
+          })
+          .onTouch((e: TouchEvent) => {
+            if (e.type === TouchType.Down) {
+              this.pressedKey = '__fab__';
+            } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) &&
+              this.pressedKey === '__fab__') {
+              this.pressedKey = '';
+            }
+          })
+          .onClick(() => {
+            this.startAutoClaim();
+          })
         }
       }
       .width('100%')
       .height('100%')
-
-      // 悬浮胶囊盖在内容最上层：居中贴底，胶囊之外点击透明穿透到下方内容
-      Column() {
-        this.NavCapsule()
-      }
-      .width('100%')
-      .alignItems(HorizontalAlign.Center)
-      .hitTestBehavior(HitTestMode.Transparent)
-      .padding({ bottom: this.getUIContext().px2vp(this.bottomInset) + 12 })
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(COLOR_BG)
+    .backgroundColor(this.pal().COLOR_BG)
   }
 }

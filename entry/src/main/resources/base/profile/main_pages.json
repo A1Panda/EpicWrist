@@ -1,6 +1,7 @@
 {
   "src": [
     "pages/Index",
-    "pages/Claim"
+    "pages/Claim",
+    "pages/Logs"
   ]
 }

@@ -8,7 +8,7 @@ import { preferences } from '@kit.ArkData';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { common } from '@kit.AbilityKit';
 import { http } from '@kit.NetworkKit';
-import { FREE_STORE, GameItem } from './EpicFree';
+import { FREE_STORE, GameItem, MOBILE_STORE_URL, PLATFORM_MOBILE } from './EpicFree';
 
 // preferences 里的历史存档键
 const HIST_KEY: string = 'freeHistory';
@@ -23,8 +23,12 @@ const EXT_URL: string =
 const WEEK_MS: number = 7 * 24 * 3600 * 1000;
 // 进程内缓存刷新间隔：数据每周才变，半天重拉一次足够（失败同样冷却，避免反复重试）
 const EXT_TTL_MS: number = 12 * 3600 * 1000;
+// 第三方全量历史的持久化缓存键：杀后台不丢，半天内冷启动直接用缓存不联网
+const EXT_CACHE_KEY: string = 'extHistory';
+// 第三方原始行（含 platform 字段）的持久化缓存键：供“手机限免”冷启动时直接取，无需重新下载名单
+const EXT_RAW_KEY: string = 'extRawRows';
 
-// josephmate JSON 条目（只用到的字段）
+// josephmate JSON 条目（只用到的字段；platform 取值 'pc' / 'android' / 'ios'，老条目为空串）
 interface ExtRow {
   gameTitle?: string;
   freeDate?: string;
@@ -32,6 +36,7 @@ interface ExtRow {
   urlSlug?: string;
   steamUrl?: string;
   steamDBUrl?: string;
+  platform?: string;
 }
 
 // 第三方全量历史的进程内缓存
@@ -40,6 +45,19 @@ interface ExtState {
   at: number;
 }
 const extState: ExtState = { list: [], at: 0 };
+
+// 第三方原始行（含 platform 字段）的进程内共享缓存：历史页与“手机限免”共用同一份下载结果
+interface RawRows {
+  rows: ExtRow[];
+  at: number;
+}
+const extRaw: RawRows = { rows: [], at: 0 };
+
+// 记录一次成功的原始行下载（fetchExternalHistory 解析成功后调用，避免手机限免重复联网）
+function rememberRows(rows: ExtRow[]): void {
+  extRaw.rows = rows;
+  extRaw.at = Date.now();
+}
 
 // 历史条目：t=游戏名，img=封面 URL，url=官方商店页（可跳转看游戏介绍），
 // startMs/endMs=该期免费开放时段，seenMs=首次被本应用检测到的时刻，
@@ -493,13 +511,75 @@ function dayKey(ms: number): string {
   return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
 }
 
-// 读取本地历史（存时即按最新在前，此处原样返回）
+// 判定两条记录是否属于“同一免费期”：同名游戏且免费区间有重叠。
+// 背景：同一款游戏的一次赠送常连续免费好几天，旧版把“检测时刻”当 startMs，
+// 跨天检测会生成不同的“标题|日期”键，把同一期拆成多条重复入库。
+// 规则：同一游戏的两期不可能同时免费，因此只要时间窗相交就是同一期；
+// 官方偶尔顺延截止日期（结束日变化）时也能据此归并，不会另起一条。
+function sameRound(a: HistItem, b: HistItem): boolean {
+  if (a.t !== b.t) {
+    return false;
+  }
+  const ae: number = a.endMs > a.startMs ? a.endMs : a.startMs + WEEK_MS;
+  const be: number = b.endMs > b.startMs ? b.endMs : b.startMs + WEEK_MS;
+  return be > a.startMs && ae > b.startMs;
+}
+
+// 把同一“免费期”的重复记录折叠为一条：取“开领更早”的为代表
+// （新版记录用真实开领日，通常早于旧版“检测时刻”，能自然顶替旧条目），
+// 封面/链接取其有值者，seenMs 取两者更早的检测时刻。
+function compactLocal(list: HistItem[]): HistItem[] {
+  const out: HistItem[] = [];
+  for (let i = 0; i < list.length; i++) {
+    const cur: HistItem = list[i];
+    let hit: number = -1;
+    for (let j = 0; j < out.length; j++) {
+      if (sameRound(out[j], cur)) {
+        hit = j;
+        break;
+      }
+    }
+    if (hit < 0) {
+      out.push(cur);
+      continue;
+    }
+    const old: HistItem = out[hit];
+    const better: HistItem = old.startMs <= cur.startMs ? old : cur;
+    const other: HistItem = better === old ? cur : old;
+    const rep: HistItem = {
+      t: better.t,
+      img: better.img.length > 0 ? better.img : other.img,
+      url: better.url.length > 0 ? better.url : other.url,
+      startMs: better.startMs,
+      endMs: better.endMs > better.startMs ? better.endMs : other.endMs,
+      seenMs: old.seenMs < cur.seenMs ? old.seenMs : cur.seenMs
+    };
+    const slug: string = better.slug ? better.slug : (other.slug ? other.slug : '');
+    if (slug.length > 0) {
+      rep.slug = slug;
+    }
+    out[hit] = rep;
+  }
+  return out;
+}
+
+// 读取本地历史（存时即按最新在前）。顺带做一次“同一期去重”自愈：
+// 旧版本留下的跨天重复会在读取时折叠回单条并回写，不会一直留在存档里。
 export async function readHistory(context: common.Context): Promise<HistItem[]> {
   try {
     const p = await preferences.getPreferences(context, { name: FREE_STORE });
     const raw = p.getSync(HIST_KEY, '[]') as string;
     const arr = JSON.parse(raw) as HistItem[];
-    return arr instanceof Array ? arr : [];
+    let list: HistItem[] = arr instanceof Array ? arr : [];
+    if (list.length > 1) {
+      const comp: HistItem[] = compactLocal(list);
+      if (comp.length !== list.length) {
+        p.putSync(HIST_KEY, JSON.stringify(comp));
+        await p.flush();
+        list = comp;
+      }
+    }
+    return list;
   } catch (e) {
     return [];
   }
@@ -519,17 +599,6 @@ export async function recordFreeNow(context: common.Context, nowArr: GameItem[])
     const now: number = Date.now();
     for (let i = 0; i < nowArr.length; i++) {
       const it: GameItem = nowArr[i];
-      const key: string = it.title + '|' + dayKey(it.startMs);
-      let dup: boolean = false;
-      for (let j = 0; j < pool.length; j++) {
-        if (pool[j].t + '|' + dayKey(pool[j].startMs) === key) {
-          dup = true;
-          break;
-        }
-      }
-      if (dup) {
-        continue;
-      }
       const item: HistItem = {
         t: it.title,
         img: it.img,
@@ -538,6 +607,17 @@ export async function recordFreeNow(context: common.Context, nowArr: GameItem[])
         endMs: typeof it.endMs === 'number' && it.endMs > now ? it.endMs : now,
         seenMs: now
       };
+      // 与已有记录按“同名 + 档期重叠”去重：同一款游戏连续免费期间反复检测到只算一期
+      let dup: boolean = false;
+      for (let j = 0; j < pool.length; j++) {
+        if (sameRound(pool[j], item)) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) {
+        continue;
+      }
       // 本地检测条目通常已带官方封面，slug 仅留作极端缺图时的 EPIC 兜底
       const slug: string = slugFromUrl(it.claim);
       if (slug.length > 0) {
@@ -561,9 +641,50 @@ export async function recordFreeNow(context: common.Context, nowArr: GameItem[])
 // 覆盖从 2018-12 首个喜加一起的每一期。每条只有开领日与商店页链接、
 // 无截止日期（展示区间按一周推定）；封面图由行内 Steam 链接解析出 appid 后
 // 用 Steam CDN header 补全（未上 Steam 的作品则降级为首字母占位块）。
-export async function fetchExternalHistory(): Promise<HistItem[]> {
+// 读第三方全量历史的持久化缓存（杀后台不丢）；无缓存/损坏返回 null
+async function readExtCache(context: common.Context): Promise<ExtState | null> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    const raw = p.getSync(EXT_CACHE_KEY, '') as string;
+    if (raw.length === 0) {
+      return null;
+    }
+    const obj = JSON.parse(raw) as ExtState;
+    if (!(obj.list instanceof Array) || typeof obj.at !== 'number') {
+      return null;
+    }
+    return obj;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 写第三方全量历史的持久化缓存（联网成功后更新，供下次冷启动秒开）
+async function saveExtCache(context: common.Context, list: HistItem[], at: number): Promise<void> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    p.putSync(EXT_CACHE_KEY, JSON.stringify({ list: list, at: at }));
+    await p.flush();
+  } catch (e) {
+  }
+}
+
+export async function fetchExternalHistory(context: common.Context): Promise<HistItem[]> {
   const now: number = Date.now();
+  // 进程内缓存命中（半天内拉取过/冷却过）：直接返回
   if (extState.list.length > 0 && now - extState.at < EXT_TTL_MS) {
+    return extState.list;
+  }
+  // 冷启动：先读持久化缓存，新鲜则秒开不联网
+  let cached: ExtState | null = null;
+  try {
+    cached = await readExtCache(context);
+  } catch (e) {
+    cached = null;
+  }
+  if (cached !== null && cached.list.length > 0 && now - cached.at < EXT_TTL_MS) {
+    extState.list = cached.list;
+    extState.at = cached.at;
     return extState.list;
   }
   try {
@@ -592,6 +713,9 @@ export async function fetchExternalHistory(): Promise<HistItem[]> {
       extState.at = now;
       return [];
     }
+    // 同一次下载结果顺手共享给“手机限免”，避免其再打一次网络
+    rememberRows(rows);
+    await saveRawRowsCache(context, rows);
     const list: HistItem[] = [];
     for (const r of rows) {
       const title: string = r.gameTitle ? r.gameTitle : '';
@@ -632,11 +756,141 @@ export async function fetchExternalHistory(): Promise<HistItem[]> {
     }
     extState.list = list;
     extState.at = now;
+    await saveExtCache(context, list, now);
     return list;
   } catch (e) {
-    extState.at = now; // 网络失败也冷却，避免每次刷新历史都反复重试
+    // 联网失败：有持久化缓存（哪怕过期）先兜底展示，避免弱网时历史页空窗；
+    // 无缓存才返回空。两种情况都把 at 置 now 冷却，避免本进程内反复重试。
+    if (cached !== null && cached.list.length > 0) {
+      extState.list = cached.list;
+      extState.at = now;
+      return extState.list;
+    }
+    extState.at = now;
     return [];
   }
+}
+
+// ================= 手机限免（复用 josephmate 名单的 platform=android 行） =================
+// EPIC 手机商店的“周免”是独立于 PC 周免的一批游戏（如 Evan's Remains 只在手机免费）。
+// josephmate 名单对每款免费都按 pc/android/ios 分行，且托管在 raw.githubusercontent（原生 http 可直连），
+// 因此手机限免不再请求会被 Cloudflare 403 拦掉的 EPIC 手机接口，改从这里取“当前窗口内”的 android 行。
+
+async function readRawRowsCache(context: common.Context): Promise<RawRows | null> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    const raw: string = p.getSync(EXT_RAW_KEY, '') as string;
+    if (raw.length === 0) {
+      return null;
+    }
+    const obj = JSON.parse(raw) as RawRows;
+    if (!(obj.rows instanceof Array)) {
+      return null;
+    }
+    return obj;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function saveRawRowsCache(context: common.Context, rows: ExtRow[]): Promise<void> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    const save: RawRows = { rows: rows, at: Date.now() };
+    p.putSync(EXT_RAW_KEY, JSON.stringify(save));
+    await p.flush();
+  } catch (e) {
+  }
+}
+
+// 取得第三方原始行：进程内 12h → 本地缓存 12h → 联网；联网失败用过期缓存兜底
+async function fetchExtRows(context: common.Context): Promise<ExtRow[]> {
+  const now: number = Date.now();
+  if (extRaw.rows.length > 0 && now - extRaw.at < EXT_TTL_MS) {
+    return extRaw.rows;
+  }
+  let cached: RawRows | null = null;
+  try {
+    cached = await readRawRowsCache(context);
+  } catch (e) {
+    cached = null;
+  }
+  if (cached !== null && cached.rows.length > 0 && now - cached.at < EXT_TTL_MS) {
+    extRaw.rows = cached.rows;
+    extRaw.at = cached.at;
+    return extRaw.rows;
+  }
+  try {
+    const text: string = await httpGetText(EXT_URL, 20000);
+    const rows = JSON.parse(text) as ExtRow[];
+    if (rows instanceof Array && rows.length > 0) {
+      rememberRows(rows);
+      await saveRawRowsCache(context, rows);
+      return rows;
+    }
+    extRaw.at = now;
+    return [];
+  } catch (e) {
+    if (cached !== null && cached.rows.length > 0) {
+      extRaw.rows = cached.rows;
+      extRaw.at = cached.at;
+      return extRaw.rows;
+    }
+    extRaw.at = now;
+    return [];
+  }
+}
+
+// 当前仍在免费窗口内的 Android 手机限免（freeDate 为开领日，EPIC 惯例“周四起免费一周”）
+export async function currentMobileFree(context: common.Context): Promise<GameItem[]> {
+  const rows: ExtRow[] = await fetchExtRows(context);
+  if (rows.length === 0) {
+    return [];
+  }
+  const now: number = Date.now();
+  const hit: GameItem[] = [];
+  const used: string[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r: ExtRow = rows[i];
+    if (r.platform !== 'android' || !r.gameTitle || !r.freeDate) {
+      continue;
+    }
+    const parts: string[] = r.freeDate.split('-');
+    if (parts.length !== 3) {
+      continue;
+    }
+    const y: number = parseInt(parts[0]);
+    const m: number = parseInt(parts[1]);
+    const d: number = parseInt(parts[2]);
+    if (isNaN(y) || isNaN(m) || isNaN(d)) {
+      continue;
+    }
+    const start: number = new Date(y, m - 1, d).getTime();
+    if (now < start || now >= start + WEEK_MS) {
+      continue;
+    }
+    if (used.indexOf(r.gameTitle) >= 0) {
+      continue;
+    }
+    used.push(r.gameTitle);
+    let claim: string = r.epicStoreLink ? r.epicStoreLink : '';
+    if (claim.length === 0 && r.urlSlug && r.urlSlug.length > 0) {
+      claim = 'https://store.epicgames.com/en-US/p/' + r.urlSlug;
+    }
+    if (claim.length === 0) {
+      claim = MOBILE_STORE_URL;
+    }
+    const item: GameItem = {
+      title: r.gameTitle,
+      sub: 'Android 手机免费',
+      img: steamCover(r),
+      claim: claim,
+      startMs: start,
+      platform: PLATFORM_MOBILE
+    };
+    hit.push(item);
+  }
+  return hit;
 }
 
 // 页面读历史：本地记录 + 第三方全量历史去重合并，按开领时刻新→旧排序。
@@ -646,7 +900,7 @@ export async function readHistoryMerged(context: common.Context): Promise<HistIt
   const local: HistItem[] = await readHistory(context);
   let ext: HistItem[] = [];
   try {
-    ext = await fetchExternalHistory();
+    ext = await fetchExternalHistory(context);
   } catch (e) {
     ext = [];
   }

@@ -1,20 +1,30 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
+import {
+  THEME_FOLLOW,
+  readThemePref,
+  systemDarkOf,
+  applyColorMode,
+  modeIsDark,
+  paintWindow
+} from '../common/Theme';
 
 const DOMAIN = 0x0000;
-// 与首页背景一致的深色，避免状态栏/导航条露出黑边
-const BAR_COLOR: string = '#0E1520';
-const BAR_CONTENT_COLOR: string = '#F2F5FA';
 
 export default class EntryAbility extends UIAbility {
+  private mainWin: window.Window | null = null;
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
-    try {
-      this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
-    } catch (err) {
-      hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
-    }
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
+    // 先记录“系统真实色模式”（必须在 setColorMode 覆盖前取值，之后 AppStorage 始终保持系统值，
+    // “跟随系统”模式用它判断真实明暗；固定浅/深模式不受系统后续切换影响）。
+    const sysDark: boolean = systemDarkOf(this.context);
+    AppStorage.setOrCreate<boolean>('sysDark', sysDark);
+    // 读取用户选择的外观模式并同步给系统：赶在首帧渲染前让资源/系统材质落在正确的色模式上
+    const mode: number = readThemePref(this.context);
+    AppStorage.setOrCreate<number>('themeMode', mode);
+    applyColorMode(this.context, mode);
+    hilog.info(DOMAIN, 'testTag', 'Ability onCreate, themeMode=%{public}d sysDark=%{public}s', mode, sysDark);
   }
 
   onDestroy(): void {
@@ -22,9 +32,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
-    // Main window is created, set main page for this ability
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
-
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
         hilog.error(DOMAIN, 'testTag', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
@@ -37,24 +45,47 @@ export default class EntryAbility extends UIAbility {
     });
   }
 
+  // 系统切换深浅色（仅“跟随系统”模式下需要响应）：刷新 AppStorage 驱动页面重绘，并重刷系统栏外观
+  onConfigurationUpdate(newConfig: Configuration): void {
+    const mode: number = AppStorage.get<number>('themeMode') !== undefined ?
+      (AppStorage.get<number>('themeMode') as number) : THEME_FOLLOW;
+    if (mode === THEME_FOLLOW) {
+      AppStorage.setOrCreate<boolean>('sysDark',
+        newConfig.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK);
+      this.refreshChrome();
+    }
+  }
+
+  // 当前页面取色用的“有效深色态”：固定模式看选择，跟随模式看系统
+  private effDark(): boolean {
+    const mode: number = AppStorage.get<number>('themeMode') !== undefined ?
+      (AppStorage.get<number>('themeMode') as number) : THEME_FOLLOW;
+    const sysDark: boolean = AppStorage.get<boolean>('sysDark') !== undefined ?
+      (AppStorage.get<boolean>('sysDark') as boolean) : systemDarkOf(this.context);
+    return modeIsDark(mode, sysDark);
+  }
+
+  private refreshChrome(): void {
+    if (this.mainWin !== null) {
+      paintWindow(this.mainWin, this.effDark());
+    }
+  }
+
   // 方案：窗口全屏布局，但保留系统栏显示（顶部时间栏、底部导航/手势条）。
-  // 系统栏做成“透明 + 浅色图标”悬浮在深色页面之上，视觉连续不露黑；
+  // 系统栏做成“透明 + 随主题的图标色”悬浮在页面之上，视觉连续不露色块；
   // 页面再按 safeTop/safeBottom 避让，让内容不与时间栏/手势条重叠。
   private applyImmersive(windowStage: window.WindowStage): void {
     try {
       const win: window.Window = windowStage.getMainWindowSync();
-      // 窗口底色与页面一致，避免全屏切换瞬间边缘露黑
-      win.setWindowBackgroundColor(BAR_COLOR);
-      // 顺序关键：先全屏、再设定系统栏透明浅色样式，全部生效后才刷新避让区缓存，
+      this.mainWin = win;
+      // 窗口底色与页面一致，避免全屏切换瞬间边缘露色
+      paintWindow(win, this.effDark());
+      // 顺序关键：先全屏、再设定系统栏透明样式，全部生效后才刷新避让区缓存，
       // 否则会缓存到“系统栏样式尚未应用”时的高度，导致页面避让不准。
       win.setWindowLayoutFullScreen(true)
-        .then(() => win.setWindowSystemBarProperties({
-          statusBarColor: '#00000000',
-          navigationBarColor: '#00000000',
-          statusBarContentColor: BAR_CONTENT_COLOR,
-          navigationBarContentColor: BAR_CONTENT_COLOR
-        }))
         .then(() => {
+          // 全屏后再刷一次系统栏（paintWindow 已在全屏前设置过，全屏后属性保持，此处仅为稳妥重刷）
+          paintWindow(win, this.effDark());
           // 此刻系统栏样式已确定，刷新避让高度供页面做 padding
           this.cacheSafeAreas(win);
         })
