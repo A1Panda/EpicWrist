@@ -20,6 +20,8 @@ const STORE: string = 'epic_free_state';
 export interface AppPal {
   COLOR_BG: string;
   COLOR_CARD: string;
+  // 长列表卡片（免费/历史）专用“不透明纯色”底：不依赖实时背景模糊，避免逐卡模糊的性能开销
+  COLOR_CARD_SOLID: string;
   COLOR_HAIR: string;
   COLOR_IMG_BG: string;
   COLOR_IMG_FG: string;
@@ -50,6 +52,7 @@ export class ChromePal {
 export const PAL_DARK: AppPal = {
   COLOR_BG: '#05070D',
   COLOR_CARD: '#0DFFFFFF',
+  COLOR_CARD_SOLID: '#12161F',
   COLOR_HAIR: '#30FFFFFF',
   COLOR_IMG_BG: '#111722',
   COLOR_IMG_FG: '#5A6570',
@@ -69,6 +72,7 @@ export const PAL_DARK: AppPal = {
 export const PAL_LIGHT: AppPal = {
   COLOR_BG: '#F1F3F6',
   COLOR_CARD: '#F0FFFFFF',
+  COLOR_CARD_SOLID: '#FFFFFF',
   COLOR_HAIR: '#24000000',
   COLOR_IMG_BG: '#E3E8EF',
   COLOR_IMG_FG: '#4B5563',

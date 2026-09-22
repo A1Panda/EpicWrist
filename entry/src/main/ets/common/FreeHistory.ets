@@ -27,6 +27,14 @@ const EXT_TTL_MS: number = 12 * 3600 * 1000;
 const EXT_CACHE_KEY: string = 'extHistory';
 // 第三方原始行（含 platform 字段）的持久化缓存键：供“手机限免”冷启动时直接取，无需重新下载名单
 const EXT_RAW_KEY: string = 'extRawRows';
+// 名单“上次联网失败时刻”的持久化键：失败即写盘，冷启动/回前台在冷却期内不再重复联网。
+// 此前该冷却只存在进程内，杀后台重开就会再完整等一次超时，是弱网下“长时间加载”的主因之一。
+const EXT_FAIL_KEY: string = 'extFailAt';
+// 联网失败后的冷却时长：半小时内不再尝试，改用已有缓存兜底，弱网下体验稳定且不长时间占网
+const EXT_FAIL_COOLDOWN_MS: number = 30 * 60 * 1000;
+// 名单连接/读取超时：名单体积不大，超时压短让弱网尽快失败并回落到缓存，而不是长时间转圈
+const EXT_CONNECT_TIMEOUT_MS: number = 5000;
+const EXT_READ_TIMEOUT_MS: number = 10000;
 
 // josephmate JSON 条目（只用到的字段；platform 取值 'pc' / 'android' / 'ios'，老条目为空串）
 interface ExtRow {
@@ -111,7 +119,12 @@ const COVER_KEY: string = 'histCovers';
 // “某标题查无封面”后，距下次允许重查的间隔（成功的封面长期使用，不过期）
 const COVER_RETRY_MS: number = 7 * 24 * 3600 * 1000;
 // Steam 商店搜索最小请求间隔：补图按可见窗口串行排队，避免批量查询触发限流
-const SEARCH_GAP_MS: number = 450;
+const SEARCH_GAP_MS: number = 300;
+// 单次补图预算：单轮最多联机解析多少条 + 最长占用时间。
+// 弱网时不至于把历史页长时间占住；剩余缺图条目留到下次进入历史页/上滑加载再补
+//（查无结果已写缓存，COVER_RETRY_MS 内不会重复打扰网络）。
+const COVER_MAX_PER_RUN: number = 6;
+const COVER_BUDGET_MS: number = 8000;
 
 interface CoverEnt {
   key: string;
@@ -143,7 +156,9 @@ function httpGetText(url: string, timeoutMs: number): Promise<string> {
       url,
       {
         method: http.RequestMethod.GET,
-        connectTimeout: timeoutMs,
+        // 连接阶段单独压到 5s 上限：弱网下“连不上/连不上服务器”能尽快失败，
+        // 不会整段卡在读超时上（连接建立后的正常下载仍按 timeoutMs 放宽）。
+        connectTimeout: Math.min(timeoutMs, 5000),
         readTimeout: timeoutMs,
         expectDataType: http.HttpDataType.STRING
       },
@@ -335,7 +350,7 @@ async function steamSearchAppId(term: string): Promise<number> {
   await sleep(SEARCH_GAP_MS); // 串行节流，避免批量查询被限流
   const url: string = 'https://store.steampowered.com/api/storesearch/?term=' +
     encodeURIComponent(term) + '&l=en&cc=US';
-  const text: string = await httpGetText(url, 12000);
+  const text: string = await httpGetText(url, 6000);
   const resp: SteamSearchResp = JSON.parse(text) as SteamSearchResp;
   const items = resp.items;
   if (!(items instanceof Array)) {
@@ -363,7 +378,7 @@ async function resolveSteamCover(title: string): Promise<string> {
         break; // 搜索本身成功但没匹配：换下一个候选词
       } catch (e) {
         if (t === 0) {
-          await sleep(1500);
+          await sleep(900);
         } else {
           break; // 两遍都失败：放弃该候选词
         }
@@ -381,7 +396,7 @@ async function resolveEpicCover(slug: string): Promise<string> {
   const url: string = 'https://store-content.ak.epicgames.com/api/en-US/content/products/' + slug;
   let text: string = '';
   try {
-    text = await httpGetText(url, 10000);
+    text = await httpGetText(url, 6000);
   } catch (e) {
     return '';
   }
@@ -450,6 +465,10 @@ export async function backfillHistCovers(context: common.Context, list: HistItem
   const end: number = Math.min(limit, list.length);
   const hitIdx: number[] = [];
   const hitImg: string[] = [];
+  // 预算控制：本轮实际联机次数与起始时刻。弱网下最多耗 COVER_BUDGET_MS / 解析 COVER_MAX_PER_RUN 条，
+  // 超预算即停（剩余条目留待下次进入历史页/上滑加载再补），不让补图把页面长时间占住。
+  const startedAt: number = Date.now();
+  let netUsed: number = 0;
   for (let i = 0; i < end; i++) {
     const it: HistItem = list[i];
     if (it.img.length > 0) {
@@ -471,7 +490,12 @@ export async function backfillHistCovers(context: common.Context, list: HistItem
         continue; // 最近才查过且无结果：不重复打扰网络
       }
     }
-    // 需要联网解析：Steam 商店搜索优先，EPIC 内容接口兜底
+    // 需要联网解析：Steam 商店搜索优先，EPIC 内容接口兜底。
+    // 先过预算：本轮联机条数或总耗时已达上限就直接收尾，弱网下不会无限拖住历史页。
+    if (netUsed >= COVER_MAX_PER_RUN || Date.now() - startedAt > COVER_BUDGET_MS) {
+      break;
+    }
+    netUsed++;
     let img: string = '';
     try {
       img = await resolveSteamCover(title);
@@ -669,6 +693,27 @@ async function saveExtCache(context: common.Context, list: HistItem[], at: numbe
   }
 }
 
+// 读“上次联网失败时刻”（磁盘）；无记录或读取失败返回 0
+async function readExtFailAt(context: common.Context): Promise<number> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    const v = p.getSync(EXT_FAIL_KEY, 0) as number;
+    return typeof v === 'number' && v > 0 ? v : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// 记“本次联网失败时刻”到磁盘：让冷却跨进程生效（杀后台重开也不会立刻再等一次超时）
+async function saveExtFailAt(context: common.Context, at: number): Promise<void> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    p.putSync(EXT_FAIL_KEY, at);
+    await p.flush();
+  } catch (e) {
+  }
+}
+
 export async function fetchExternalHistory(context: common.Context): Promise<HistItem[]> {
   const now: number = Date.now();
   // 进程内缓存命中（半天内拉取过/冷却过）：直接返回
@@ -687,6 +732,14 @@ export async function fetchExternalHistory(context: common.Context): Promise<His
     extState.at = cached.at;
     return extState.list;
   }
+  // 失败冷却（跨进程持久化）：上次联网失败在冷却期内，直接用过期缓存兜底，不再等一次超时；
+  // 无缓存才返回空。extState.at 置 now 让本进程同一冷却期内也不再走这段逻辑。
+  const failAt: number = await readExtFailAt(context);
+  if (failAt > 0 && now - failAt < EXT_FAIL_COOLDOWN_MS) {
+    extState.list = cached !== null ? cached.list : [];
+    extState.at = now;
+    return extState.list;
+  }
   try {
     const text: string = await new Promise<string>((resolve, reject) => {
       const req = http.createHttp();
@@ -694,8 +747,8 @@ export async function fetchExternalHistory(context: common.Context): Promise<His
         EXT_URL,
         {
           method: http.RequestMethod.GET,
-          connectTimeout: 10000,
-          readTimeout: 20000,
+          connectTimeout: EXT_CONNECT_TIMEOUT_MS,
+          readTimeout: EXT_READ_TIMEOUT_MS,
           expectDataType: http.HttpDataType.STRING
         },
         (err: BusinessError, data: http.HttpResponse) => {
@@ -759,8 +812,9 @@ export async function fetchExternalHistory(context: common.Context): Promise<His
     await saveExtCache(context, list, now);
     return list;
   } catch (e) {
-    // 联网失败：有持久化缓存（哪怕过期）先兜底展示，避免弱网时历史页空窗；
-    // 无缓存才返回空。两种情况都把 at 置 now 冷却，避免本进程内反复重试。
+    // 联网失败：把失败时刻写盘，冷却期内（含下次冷启动）不再重试，避免弱网反复等超时；
+    // 有持久化缓存（哪怕过期）先兜底展示，避免历史页空窗；无缓存才返回空。
+    await saveExtFailAt(context, now);
     if (cached !== null && cached.list.length > 0) {
       extState.list = cached.list;
       extState.at = now;
@@ -820,8 +874,15 @@ async function fetchExtRows(context: common.Context): Promise<ExtRow[]> {
     extRaw.at = cached.at;
     return extRaw.rows;
   }
+  // 失败冷却（与历史名单共用同一持久化标记）：冷却期内直接用过期缓存兜底，不再等超时
+  const failAt: number = await readExtFailAt(context);
+  if (failAt > 0 && now - failAt < EXT_FAIL_COOLDOWN_MS) {
+    extRaw.rows = cached !== null ? cached.rows : [];
+    extRaw.at = now;
+    return extRaw.rows;
+  }
   try {
-    const text: string = await httpGetText(EXT_URL, 20000);
+    const text: string = await httpGetText(EXT_URL, EXT_READ_TIMEOUT_MS);
     const rows = JSON.parse(text) as ExtRow[];
     if (rows instanceof Array && rows.length > 0) {
       rememberRows(rows);
@@ -831,6 +892,7 @@ async function fetchExtRows(context: common.Context): Promise<ExtRow[]> {
     extRaw.at = now;
     return [];
   } catch (e) {
+    await saveExtFailAt(context, now);
     if (cached !== null && cached.rows.length > 0) {
       extRaw.rows = cached.rows;
       extRaw.at = cached.at;
@@ -893,17 +955,10 @@ export async function currentMobileFree(context: common.Context): Promise<GameIt
   return hit;
 }
 
-// 页面读历史：本地记录 + 第三方全量历史去重合并，按开领时刻新→旧排序。
+// 本地记录 + 第三方记录去重合并，按开领时刻新→旧排序。
 // 去重规则：同键（同标题同日）跳过；同一游戏若与已收记录的起始时刻相差不足一周，
 // 视为同一免费周，第三方那条不加入 —— 本地记录（含真实封面/截止日）始终优先保留。
-export async function readHistoryMerged(context: common.Context): Promise<HistItem[]> {
-  const local: HistItem[] = await readHistory(context);
-  let ext: HistItem[] = [];
-  try {
-    ext = await fetchExternalHistory(context);
-  } catch (e) {
-    ext = [];
-  }
+function mergeHistory(local: HistItem[], ext: HistItem[]): HistItem[] {
   const merged: HistItem[] = [];
   const keys: string[] = [];
   const nearWeek = (h: HistItem, list: HistItem[]): boolean => {
@@ -935,7 +990,40 @@ export async function readHistoryMerged(context: common.Context): Promise<HistIt
     }
   }
   merged.sort((a: HistItem, b: HistItem): number => b.startMs - a.startMs);
+  return merged;
+}
+
+// 页面读历史（联网路径）：本地记录 + 第三方全量历史（进程内/持久化缓存优先，缓存过期才联网）
+// 去重合并后回填已缓存封面。冷启动/返回前台不应直接用它，改用 readHistoryMergedCached 秒开。
+export async function readHistoryMerged(context: common.Context): Promise<HistItem[]> {
+  const local: HistItem[] = await readHistory(context);
+  let ext: HistItem[] = [];
+  try {
+    ext = await fetchExternalHistory(context);
+  } catch (e) {
+    ext = [];
+  }
+  const merged: HistItem[] = mergeHistory(local, ext);
   // 已解析过的封面（含上次会话写入缓存的结果）直接回填，减少进入历史时的联网补图
+  await ensureCoversLoaded(context);
+  return fillCoversFromCache(merged);
+}
+
+// 历史“秒开”读取：只用本地记录 + 已持久化的第三方缓存，完全不联网。
+// 冷启动与返回前台先用它把历史铺出来（有缓存时零等待），联网补全交给后台刷新负责，
+// 这样弱网/断网下历史页也不会长时间空窗或转圈。
+export async function readHistoryMergedCached(context: common.Context): Promise<HistItem[]> {
+  const local: HistItem[] = await readHistory(context);
+  let ext: HistItem[] = [];
+  try {
+    const cached: ExtState | null = await readExtCache(context);
+    if (cached !== null && cached.list instanceof Array) {
+      ext = cached.list;
+    }
+  } catch (e) {
+    ext = [];
+  }
+  const merged: HistItem[] = mergeHistory(local, ext);
   await ensureCoversLoaded(context);
   return fillCoversFromCache(merged);
 }

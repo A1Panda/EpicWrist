@@ -31,14 +31,21 @@ export const GRIP_KEY: string = 'gripAdapt';        // 智感握持开关：true
 export const FAB_RIGHT_KEY: string = 'fabSideRight'; // 智感握持关闭时手动固定按钮：true=右下角 false=左下角
 export const GLOW_KEY: string = 'glowLevel';        // 沉浸光效强度档位：0=柔和 1=标准(默认) 2=增强
 export const CLAIMED_KEY: string = 'claimedTitles'; // 自动领取已成功入库的游戏标题
+export const OWNED_KEY: string = 'ownedTitles';     // 从账号「交易→购买」页同步到的“已拥有”游戏标题
 export const CAL_KEY: string = 'calOn';             // “自动把即将免费加入日历”开关
-export const CAL_DONE_KEY: string = 'calDone';      // 已写入系统日历的 “标题|开领日期” 数组（去重用）
+export const CAL_DONE_KEY: string = 'calDone';      // 已写入系统日历的 “日程标题|开领时刻” 数组（去重用）
 export const LAST_LISTS_KEY: string = 'lastFreeLists'; // 最近一次成功拉到的列表（弱网时兜底秒开）
 export const LAST_MOBILE_KEY: string = 'lastMobileFree'; // 最近一次成功拉到的手机免费游戏（手机接口偶发失败时兜底）
 
 // EPIC 登录/领取页地址（自动领取=内置网页模拟用户点“获取”，需保持 EPIC 登录态）
-export const CLAIM_LOGIN_URL: string = 'https://accounts.epicgames.com/login';
+export const CLAIM_LOGIN_URL: string = 'https://www.epicgames.com/id/login';
 export const CLAIM_STORE_URL: string = 'https://store.epicgames.com/free-games';
+// 账号「交易 → 购买」页：网页端唯一能拿到本人领取/购买记录的入口。
+// EPIC 官方不提供网页版游戏库（只能在启动器里看），此页会列出免费领取与购买记录，社区也用它核对是否领过。
+// 必须带 lang=en-US：该页标题会按账号语言本地化（如 Mindcop 显示为“心灵警探”、
+// 《Foretales》显示为“Foretales”带书名号），而应用内历史/列表标题取自 en-US 接口，
+// 只有把页面也切成 en-US 才能保证两边标题一致，正确标记“已领取”。
+export const CLAIM_HISTORY_URL: string = 'https://www.epicgames.com/account/transactions?productName=egs&lang=en-US';
 
 // 手机“周免”与 PC 周免是两批不同的游戏（如 Evan's Remains 只在手机免费）。
 // 手机数据由 FreeHistory 的 josephmate 全量名单（platform=android 行）提供；
@@ -260,8 +267,10 @@ function pickFree(groups: PromoGroup[] | undefined, now: number, wantNow: boolea
 // ================= 抓取与解析 =================
 
 // 请求一次接口；拿到文本 resolve；网络/非 200/超时一律 reject。
-// 内置 20s 看门狗：极差网络下若连接半开、响应迟迟不回来（readTimeout 不触发），
+// 内置 12s 看门狗：极差网络下若连接半开、响应迟迟不回来（readTimeout 不触发），
 // 也会强制按失败收尾，保证调用方永远不会停在“一直加载中”。
+// 超时值刻意压短（连接 5s / 读取 10s）：接口响应是小 JSON，弱网下尽快失败并回落到本地缓存，
+// 比让用户盯着整页 Loading 十几秒要好。
 function requestText(url: string, errName: string, header?: Object): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const req = http.createHttp();
@@ -280,11 +289,11 @@ function requestText(url: string, errName: string, header?: Object): Promise<str
     const guard: number = setTimeout(() => {
       const te: BusinessError = { code: 10505002, name: 'TimeoutError', message: errName + '超时' } as BusinessError;
       finishErr(te);
-    }, 20000);
+    }, 12000);
     const options: http.HttpRequestOptions = {
       method: http.RequestMethod.GET,
-      connectTimeout: 10000,
-      readTimeout: 15000,
+      connectTimeout: 5000,
+      readTimeout: 10000,
       expectDataType: http.HttpDataType.STRING
     };
     if (header !== undefined) {
@@ -617,6 +626,29 @@ export async function markClaimed(context: common.Context, titles: string[]): Pr
   }
 }
 
+// 读取从账号「交易→购买」页同步到的“已拥有”游戏标题数组
+export async function readOwned(context: common.Context): Promise<string[]> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    const raw = p.getSync(OWNED_KEY, '[]') as string;
+    const arr = JSON.parse(raw) as string[];
+    return arr instanceof Array ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+// 覆盖写入“已拥有”游戏标题（账号同步结果，整体替换而非累加）
+export async function saveOwned(context: common.Context, titles: string[]): Promise<void> {
+  try {
+    const p = await preferences.getPreferences(context, { name: FREE_STORE });
+    p.putSync(OWNED_KEY, JSON.stringify(titles));
+    await p.flush();
+  } catch (e) {
+    // 存档失败不阻断主流程
+  }
+}
+
 // ================= 判新与合并 =================
 
 // 本次“现在免费”里、尚未见过的标题（最多取前 5 个）
@@ -676,31 +708,31 @@ export async function publishFreeNotice(titles: string[], requestPermission: boo
   await notificationManager.publish(req);
 }
 
-// ================= 系统日历：把“即将免费”自动写成全天日程 =================
-// 开关开启后：每次拉到“即将免费”列表，就为还没写过的游戏在“开领当天”建一条
-// 全天日程；重复刷新按 “标题|开领日期” 去重，不会反复建日程。
+// ================= 系统日历：把“即将免费”按“开领时刻”写成日程 =================
+// 开关开启后：每次拉到“即将免费”列表，就为还没写过的游戏在“开领那一刻”建一条定时
+// 日程，提醒设在日程开始时（reminderTime [0]）＝精确开领时刻；重复刷新按
+// “标题|开领时刻” 去重，不会反复建日程。
+// 注意：EPIC 开领时刻多为北京时间 23:00（夏令时）或次日 00:00（冬令时），
+// 所以不能写成“开领日全天日程 + 上午提醒”——那会比真正开领早十几小时误报。
 
 // 本应用自建的本地日历账号名（首次写入时创建，之后按账号复用）
 const CAL_ACCOUNT_NAME: string = 'epic_free_cal';
 
-// 毫秒时刻所在“当天 00:00”（本地时区，全天日程的开始点）
+// 开领日程时长：开领时刻起半小时的标记块（提醒落在块首，即开领那一刻）
+const CAL_EVENT_MS: number = 30 * 60 * 1000;
+
+// 毫秒时刻所在“当天 00:00”（本地时区，算同一天边界用）
 export function dayStartMs(ms: number): number {
   const d = new Date(ms);
   d.setHours(0, 0, 0, 0);
   return d.getTime();
 }
 
-// 毫秒时刻所在“当天 23:59:59”（本地时区，全天日程的结束点）
+// 毫秒时刻所在“当天 23:59:59”（本地时区，算同一天边界用）
 export function dayEndMs(ms: number): number {
   const d = new Date(ms);
   d.setHours(23, 59, 59, 0);
   return d.getTime();
-}
-
-// 日期键：同一游戏不同周的免费档不会互相去重
-function dayKey(ms: number): string {
-  const d = new Date(ms);
-  return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
 }
 
 // 开领时刻中文文案（M月d日 HH:mm），写进日程描述便于看精确时间
@@ -754,7 +786,36 @@ async function saveCalDone(context: common.Context, list: string[]): Promise<voi
   }
 }
 
-// 把“即将免费”的开领日批量写成全天日程，返回本次实际新写入的条数。
+// 删除本应用日历里“同名 + 同一天”的旧日程：
+// 旧版本按“开领日全天日程 + 上午提醒”写过年内同一期（起点是当天 0 点，也可能与冬令时开领时刻撞车），
+// 时间不准，先清掉再按精确开领时刻重写，避免同日重复与提前误报。
+async function dropStaleEvents(cal: calendarManager.Calendar, title: string, startMs: number): Promise<void> {
+  try {
+    const evs: calendarManager.Event[] = await cal.getEvents(
+      calendarManager.EventFilter.filterByTime(dayStartMs(startMs), dayEndMs(startMs)),
+      ['id', 'title', 'startTime', 'isAllDay']
+    );
+    for (let i = 0; i < evs.length; i++) {
+      const e: calendarManager.Event = evs[i];
+      const id: number | undefined = e.id;
+      // 现在写的一律是“非全天 + 起点＝开领时刻”；其余同名日程都是旧版本留下的
+      const stale: boolean = e.isAllDay === true || e.startTime !== startMs;
+      if (id === undefined || e.title !== title || !stale) {
+        continue;
+      }
+      try {
+        await cal.deleteEvent(id);
+      } catch (err) {
+        // 单条删除失败不阻塞后续写入
+      }
+    }
+  } catch (e) {
+    // 查询失败（无权限等）不阻塞写入
+  }
+}
+
+// 把“即将免费”的开领时刻批量写成定时日程，返回本次实际新写入的条数。
+// 日程块从开领时刻起，提醒（reminderTime [0]）正好落在开领那一刻，保证“到点才提醒”。
 // 需要已授权 ohos.permission.WRITE_CALENDAR / READ_CALENDAR，无权限或失败静默返回 0。
 export async function addFreeToCalendar(context: common.Context, items: GameItem[]): Promise<number> {
   if (items.length === 0) {
@@ -786,19 +847,27 @@ export async function addFreeToCalendar(context: common.Context, items: GameItem
     const done: string[] = await readCalDone(context);
     for (let i = 0; i < items.length; i++) {
       const it: GameItem = items[i];
-      const key: string = it.title + '|' + dayKey(it.startMs);
+      const start: number = it.startMs;
+      // 开领时刻缺失/解析失败的档期不写日程（避免落到 1970 或无效时间）
+      if (!(start > 0)) {
+        continue;
+      }
+      const evTitle: string = 'EPIC免费开领：《' + it.title + '》';
+      const key: string = evTitle + '|' + start;
       if (done.indexOf(key) >= 0) {
         continue;
       }
+      await dropStaleEvents(cal, evTitle, start);
       const ev: calendarManager.Event = {
         type: calendarManager.EventType.NORMAL,
-        title: 'EPIC免费开领：《' + it.title + '》',
-        startTime: dayStartMs(it.startMs),
-        endTime: dayEndMs(it.startMs),
-        isAllDay: true,
-        // 全天日程的提醒锚定在当天（[0] 即当天上午提醒）；精确开领时刻写入描述
+        title: evTitle,
+        // 定时日程（非全天）：起点＝精确开领时刻，不是当天 0 点
+        startTime: start,
+        endTime: start + CAL_EVENT_MS,
+        isAllDay: false,
+        // 提前 0 分钟＝日程开始时提醒，即开领那一刻
         reminderTime: [0],
-        description: '该游戏将于 ' + fmtFreeAt(it.startMs) +
+        description: '该游戏将于 ' + fmtFreeAt(start) +
           ' 在 EPIC 商店免费开领，打开 EPIC喜加一 可一键领取'
       };
       try {

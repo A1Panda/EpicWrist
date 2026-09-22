@@ -3,7 +3,6 @@ import { promptAction, router, uiMaterial } from '@kit.ArkUI';
 import { notificationManager } from '@kit.NotificationKit';
 import { workScheduler } from '@kit.BackgroundTasksKit';
 import { motion } from '@kit.MultimodalAwarenessKit';
-import { hdsEffect } from '@kit.UIDesignKit';
 import { THEME_FOLLOW, THEME_LIGHT, THEME_DARK, AppPal, appPal, applyModeAndRefreshChrome } from '../common/Theme';
 import {
   WORK_ID,
@@ -25,6 +24,7 @@ import {
   readFabRight,
   saveFabRight,
   readClaimed,
+  readOwned,
   freshTitles,
   mergeSeen,
   publishFreeNotice,
@@ -39,25 +39,41 @@ import {
   saveLastMobile,
   addFreeToCalendar
 } from '../common/EpicFree';
-import { HistItem, recordFreeNow, readHistoryMerged, backfillHistCovers, currentMobileFree } from '../common/FreeHistory';
+import { HistItem, recordFreeNow, readHistoryMerged, readHistoryMergedCached, backfillHistCovers, currentMobileFree } from '../common/FreeHistory';
 import { appendLog } from '../common/Log';
 
 // ================= 配色（系统沉浸光感适配：近黑冷底 + 官方模糊材质层） =================
-// 光效全部走官方方案：卡片/面板=系统模糊材质（backgroundBlurStyle）、悬浮控件=系统材质（systemMaterial）、
-// 按压反馈=官方 hdsEffect；应用内不再手写光晕/辉光/渐变发光。
+// 光效全部走官方方案：设置面板=系统模糊材质（backgroundBlurStyle）、底部栏=系统材质（systemMaterial）；
+// 悬浮领取按钮不在沉浸光感生效范围内，改用 backgroundColor+backgroundBlurStyle 模拟玻璃观感；
+// 免费/历史等长列表卡片改为不透明纯色底（COLOR_CARD_SOLID），不再逐卡实时模糊与按压点光，避免长列表性能开销。
 
 // 历史页“滑动加载更多”：首次只渲染一页，滑到底部再按此数量追加（避免上千条一次性全部渲染）
 const HIST_PAGE: number = 20;
 // 缓存新鲜窗口：EPIC 免费档期每周四才更新，6 小时内成功拉取的数据视为“够新”，
 // 启动时直接展示缓存不自动联网；只有无缓存或缓存过期才启动自动刷新。
 const CACHE_FRESH_MS: number = 6 * 3600 * 1000;
+// 历史名单联网刷新的最小间隔：名单每周四才更新一次，回前台不必每次都联网；
+// 弱网下这个节流尤其关键——不会每次切回历史页都触发一次联网。
+const HIST_REFRESH_GAP_MS: number = 30 * 60 * 1000;
+// 免费列表拉取失败后的冷却：弱网/断网时避免每次回前台都重新发起请求（最长十几秒），
+// 冷却期内沿用已有缓存/失败态展示；用户点“重试”会手动绕过冷却立刻再试。
+const LOAD_FAIL_COOLDOWN_MS: number = 60 * 1000;
+// 标题归一化：账号同步回来的标题与历史标题来源不同，写法常有差异
+// （如「Down in Bermuda（逃出百慕大）」vs「Down in Bermuda」、全/半角括号、大小写与标点），
+// 统一去掉括号补充说明与非字母数字字符后再比对，避免“明明已入库却匹配不上”。
+function normTitle(s: string): string {
+  let t: string = s.toLowerCase();
+  t = t.replace(/[（(][^）)]*[）)]/g, '');
+  t = t.replace(/[^a-z0-9\u4e00-\u9fa5]/g, '');
+  return t;
+}
 
 // ================= “沉浸光效强度”三档（0=柔和 1=标准 2=增强，默认标准） =================
-// 各档位同时作用于三处官方光效参数：底部栏/悬浮按钮的系统材质（style+玻璃着色+触点光）、
-// 内容卡片的 hdsEffect 按压点光。数值均取系统材质枚举与官方光效的合法档，不手绘任何光晕。
-const GLOW_SOFT: number = 0;     // 柔和：轻薄玻璃 + 低亮触点光 + 轻按压点光
+// 档位作用于底部栏的系统材质（style+玻璃着色+触点光）与悬浮按钮的磨砂档位，两者外观保持一致。
+// 列表卡片已不使用光效，统一走不透明纯色底以保证长列表性能；数值均取系统材质枚举与官方光效的合法档。
+const GLOW_SOFT: number = 0;     // 柔和：轻薄玻璃 + 低亮触点光
 const GLOW_NORMAL: number = 1;   // 标准：默认平衡档（保持出厂观感）
-const GLOW_STRONG: number = 2;   // 增强：厚重玻璃 + 高亮触点光 + 强按压点光
+const GLOW_STRONG: number = 2;   // 增强：厚重玻璃 + 高亮触点光
 // ================= 底部悬浮 TabBar（官方 Tabs 通道）几何 =================
 // 结构已从“自绘 Stack 胶囊叠在内容区”改为官方 Tabs(barPosition=End) 悬浮底栏：
 // 系统沉浸材质/按压光效只对“底部 TabBar”区域开放，内容区自绘容器永远不会出官方效果。
@@ -119,13 +135,15 @@ struct Index {
   // 历史页实际渲染的可见子集：始终只保留前若干条，滑到底部再追加（数据总条数见 histList）
   @State histShown: HistItem[] = [];
   @State notifyOn: boolean = false;
-  // 自动把“即将免费”加入系统日历：true=拉到新档期就写全天日程并提醒
+  // 自动把“即将免费”加入系统日历：true=拉到新档期就按开领时刻写日程并在开领那一刻提醒
   @State calOn: boolean = false;
   private calSyncing: boolean = false;
   // 领取方式：false=跳转领取（点卡片用系统浏览器打开） true=自动领取（点悬浮按钮批量代领）
   @State claimAuto: boolean = false;
   // 已自动领取成功入库的游戏标题（卡片据此显示“已领取”并跳过重复尝试）
   @State claimedTitles: string[] = [];
+  // 从登录的 EPIC 账号「交易→购买」页同步到的“已拥有”标题（与 claimedTitles 一起判定“已入库”）
+  @State ownedTitles: string[] = [];
   @State curTab: number = 0;
   // 当前被按住的卡片键（用于克制微动效：按压 0.985 微缩），松手清空
   @State pressedKey: string = '';
@@ -145,8 +163,20 @@ struct Index {
   @StorageProp('safeBottom') bottomInset: number = 0;
   private inflight: boolean = false;
   private lastLoad: number = 0;
+  // 上次免费列表拉取失败时刻：用于失败冷却，避免弱网下每次回前台都重新等一次超时
+  private loadFailAt: number = 0;
+  // “已入库标题”的归一化集合（claimedTitles + ownedTitles）：isClaimed 一次查表即可，
+  // 既避免每次渲染都做 O(n*m) 比对，又能容忍两边来源的写法差异
+  private ownedNormSet: Set<string> = new Set<string>();
   private seenFree: string[] = [];
   private prefReady: boolean = false;
+  // 上次历史“联网刷新”时刻：回前台/切页按 HIST_REFRESH_GAP_MS 节流，避免弱网下频繁联网
+  private histLoadAt: number = 0;
+  // 历史联网刷新是否进行中（单飞，避免节流窗口内的并发请求）
+  private histNetBusy: boolean = false;
+  // 历史列表是否正在后台联网补全：仅在“本地/缓存为空”时用于给占位提示，
+  // 避免首次启动（无任何缓存）误显示“还没有历史记录”。
+  @State histFetching: boolean = false;
   // 历史页补图是否进行中（只对可见窗口补、单飞，避免并发重复请求）
   private histFillBusy: boolean = false;
 
@@ -221,7 +251,13 @@ struct Index {
       this.glowLevel = gl;
       const claimed: string[] = await readClaimed(ctx);
       this.claimedTitles = claimed;
-      const hist: HistItem[] = await readHistoryMerged(ctx);
+      const owned: string[] = await readOwned(ctx);
+      this.ownedTitles = owned;
+      this.rebuildOwnedSet();
+      // 历史“秒开”：只读本地记录 + 已持久化的第三方缓存，完全不联网。
+      // 冷启动因此不会被第三方名单下载（弱网下最长可等十几秒）卡住；
+      // 联网补全改到 prefReady 之后由后台刷新做，页面先拿缓存把历史铺出来。
+      const hist: HistItem[] = await readHistoryMergedCached(ctx);
       this.histList = hist;
       // 首次只展示约一页（终点对齐到整月，月份标题不会被截断），其余滑动到底部按需追加
       this.histShown = hist.slice(0, histAlignMonthEnd(hist, Math.min(HIST_PAGE, hist.length)));
@@ -248,6 +284,9 @@ struct Index {
     if (!this.hasAnyList() || cacheAt < 0 || Date.now() - cacheAt > CACHE_FRESH_MS) {
       this.load();
     }
+    // 历史名单后台补全：缓存够新时会被 FreeHistory 内部直接命中，不会真正联网；
+    // 缓存过期或首次启动才下载，且失败会进冷却，不阻塞上面的首屏秒开。
+    this.refreshHistoryNet();
   }
 
   onPageShow(): void {
@@ -271,8 +310,13 @@ struct Index {
     this.stopHoldListen();
   }
 
-  load(): void {
+  load(manual?: boolean): void {
     if (this.inflight) {
+      return;
+    }
+    // 失败冷却：自动触发（启动/回前台）在冷却期内直接跳过，避免弱网下反复长时间加载；
+    // 用户点“重试”传 manual=true 可立刻绕过节流。
+    if (!manual && this.loadFailAt > 0 && Date.now() - this.loadFailAt < LOAD_FAIL_COOLDOWN_MS) {
       return;
     }
     this.inflight = true;
@@ -293,6 +337,7 @@ struct Index {
       this.refreshing = false;
       this.loading = false;
       this.failed = true;
+      this.loadFailAt = Date.now();
     });
   }
 
@@ -334,6 +379,7 @@ struct Index {
       this.refreshing = false;
       this.loading = false;
       this.failed = true;
+      this.loadFailAt = Date.now();
       return;
     }
     const pcNowArr: GameItem[] = lists.nowArr;
@@ -349,6 +395,8 @@ struct Index {
     this.nowList = nowArr;
     this.soonList = soonArr;
     this.lastLoad = Date.now();
+    // 本次拉取成功：清掉失败冷却，让后续自动/手动刷新恢复正常节奏
+    this.loadFailAt = 0;
     this.inflight = false;
     this.refreshing = false;
     this.loading = false;
@@ -356,7 +404,7 @@ struct Index {
     saveLastLists(getContext(this) as common.Context, nowArr, soonArr);
     // 历史页数据：只把本批 PC“现在免费”并入本地历史（手机免费不入 PC 历史）
     this.recordFreeHistory(pcNowArr);
-    // 自动加入日历开启时：新拉到的“即将免费”顺手写成开领当天的全天日程
+    // 自动加入日历开启时：新拉到的“即将免费”顺手按开领时刻写成日程并在开领那一刻提醒
     if (this.calOn) {
       this.syncCalToCalendar(true);
     }
@@ -379,9 +427,33 @@ struct Index {
     }
   }
 
-  // 该游戏是否已记录为“自动领取成功入库”
+  // 该游戏是否已入库：本机自动领取成功，或从登录账号同步到的“已拥有”。
+  // 走归一化集合查表，容忍两边标题的写法差异（括号补充说明、标点、大小写）。
   private isClaimed(title: string): boolean {
-    return this.claimedTitles.indexOf(title) > -1;
+    const n: string = normTitle(title);
+    if (n.length === 0) {
+      return false;
+    }
+    return this.ownedNormSet.has(n);
+  }
+
+  // 重建“已入库标题”归一化集合（claimedTitles + ownedTitles 合并去重）
+  private rebuildOwnedSet(): void {
+    const s: Set<string> = new Set<string>();
+    let i: number = 0;
+    for (i = 0; i < this.claimedTitles.length; i++) {
+      const n: string = normTitle(this.claimedTitles[i]);
+      if (n.length > 0) {
+        s.add(n);
+      }
+    }
+    for (i = 0; i < this.ownedTitles.length; i++) {
+      const n: string = normTitle(this.ownedTitles[i]);
+      if (n.length > 0) {
+        s.add(n);
+      }
+    }
+    this.ownedNormSet = s;
   }
 
   // 点击卡片“去领取/自动领取”：按当前领取方式分发
@@ -435,6 +507,17 @@ struct Index {
     });
   }
 
+  // 打开“同步已拥有”：用已登录的 Web 会话读取账号「交易 → 购买」页，
+  // 结果落盘后返回本页，历史里属于该账号的条目会显示“已领取”
+  private pushSyncOwned(): void {
+    router.pushUrl({
+      url: 'pages/Claim',
+      params: { mode: 'sync' }
+    }).catch(() => {
+      promptAction.showToast({ message: '同步页打开失败，请重试' });
+    });
+  }
+
   // 打开设置页里的“运行日志”查看页
   private pushLogs(): void {
     router.pushUrl({
@@ -467,11 +550,17 @@ struct Index {
     this.pushClaimSession(tasks);
   }
 
-  // 从领取页/系统浏览器返回时刷新“已领取”名单，让卡片状态与真实进度同步
+  // 从领取页/系统浏览器/同步页返回时刷新“已领取 + 已拥有”名单，让卡片状态与真实进度同步
   private refreshClaimed(): void {
     const ctx = getContext(this) as common.Context;
     readClaimed(ctx).then((list: string[]) => {
       this.claimedTitles = list;
+      this.rebuildOwnedSet();
+    }).catch(() => {
+    });
+    readOwned(ctx).then((list: string[]) => {
+      this.ownedTitles = list;
+      this.rebuildOwnedSet();
     }).catch(() => {
     });
   }
@@ -479,19 +568,49 @@ struct Index {
   // ================= 历史：EPIC 送过的免费游戏 =================
 
   // 重新读取历史（进入页面/返回前台时调用）：
-  // 内容没变化时不动已渲染窗口、保留滚动位置；有变化才整体刷新，并只渲染首页条数。
+  // 分两步走——先只用本地 + 已持久化缓存“秒开”（不联网），再按间隔节流地后台联网补全。
+  // 这样弱网/断网时历史页不会长时间空窗：有缓存立即有内容，联网慢也不影响已展示的部分。
   private loadHistory(): void {
     const ctx = getContext(this) as common.Context;
-    readHistoryMerged(ctx).then((list: HistItem[]) => {
-      if (this.sameHist(this.histList, list)) {
-        return;
-      }
-      this.histList = list;
-      // 有变化才整体刷新；同样只展示约一页、终点对齐整月
-      this.histShown = list.slice(0, histAlignMonthEnd(list, Math.min(HIST_PAGE, list.length)));
-      this.fillVisibleHistCovers();
+    readHistoryMergedCached(ctx).then((list: HistItem[]) => {
+      this.applyHistList(list);
     }).catch(() => {
+    }).then(() => {
+      this.refreshHistoryNet();
     });
+  }
+
+  // 后台联网刷新第三方名单并合并历史（按 HIST_REFRESH_GAP_MS 节流、单飞）。
+  // 结果有变化才更新已渲染窗口，保留滚动位置；联网失败不改动已展示内容。
+  private refreshHistoryNet(): void {
+    const now: number = Date.now();
+    if (this.histNetBusy || now - this.histLoadAt < HIST_REFRESH_GAP_MS) {
+      return;
+    }
+    this.histNetBusy = true;
+    this.histLoadAt = now;
+    if (this.histList.length === 0) {
+      this.histFetching = true;
+    }
+    const ctx = getContext(this) as common.Context;
+    readHistoryMerged(ctx).then((list: HistItem[]) => {
+      this.applyHistList(list);
+    }).catch(() => {
+    }).then(() => {
+      this.histNetBusy = false;
+      this.histFetching = false;
+    });
+  }
+
+  // 把读到的历史列表落到渲染态：内容没变化时不动已渲染窗口（保留滚动位置），
+  // 有变化才整体刷新并只渲染首页条数，同时给可见窗口补一次封面。
+  private applyHistList(list: HistItem[]): void {
+    if (this.sameHist(this.histList, list)) {
+      return;
+    }
+    this.histList = list;
+    this.histShown = list.slice(0, histAlignMonthEnd(list, Math.min(HIST_PAGE, list.length)));
+    this.fillVisibleHistCovers();
   }
 
   // 两个历史数组内容是否一致（只比较长度与首尾项，避免回前台时把列表重置到顶部造成跳动）
@@ -586,11 +705,18 @@ struct Index {
     return '跟随系统自动切换明暗';
   }
 
-  // 底部导航切换：进入历史页时给可见窗口补一次封面
+  // 底部导航切换：立即写状态，让“选中高亮”与“页内容动效”在按下的那一刻就同步起步，
+  // 不再等 Tabs 内容滑切动画结束后的 onChange 回调（旧写法会慢一个动画周期，观感是“点完等一下才出来”）。
+  // 进入历史页时给可见窗口补一次封面（有 busy 去重，重复调用安全）。
   private switchTab(index: number): void {
-    this.curTab = index;
+    if (this.curTab !== index) {
+      this.curTab = index;
+    }
     if (index === 1) {
+      // 进入历史页：先给可见窗口补封面（有 busy 去重），再按节流窗口后台补一次名单。
+      // 二者都不阻塞渲染，历史页先在缓存上秒开。
       this.fillVisibleHistCovers();
+      this.refreshHistoryNet();
     }
   }
 
@@ -629,15 +755,15 @@ struct Index {
     return this.curTab === page ? 0 : 18;
   }
 
-  // 级联动画参数：进入=延时逐级递增；离开=不延时快速淡出。rank 封顶在 8，
-  // 长列表尾部不再无限加长，最多约 300ms 后整体入场完毕。
+  // 级联动画参数：进入=延时逐级递增；离开=不延时快速淡出。rank 封顶在 6、步长 24ms，
+  // 长列表尾部不再无限加长，最多约 144ms 后整体入场完毕（旧版封顶 8×38≈304ms，是“内容要等一下”的主因之一）。
   private entAnim(page: number, rank: number): AnimateParam {
     if (this.curTab !== page) {
-      const out: AnimateParam = { duration: 150, curve: Curve.EaseIn };
+      const out: AnimateParam = { duration: 120, curve: Curve.EaseIn };
       return out;
     }
-    const d: number = Math.min(rank, 8) * 38;
-    const inn: AnimateParam = { duration: 360, curve: Curve.FastOutSlowIn, delay: d };
+    const d: number = Math.min(rank, 6) * 24;
+    const inn: AnimateParam = { duration: 260, curve: Curve.FastOutSlowIn, delay: d };
     return inn;
   }
 
@@ -662,82 +788,25 @@ struct Index {
   // 设置页档位副文案：说明当前档位的光感侧重点
   private glowDesc(): string {
     if (this.glowLevel === GLOW_SOFT) {
-      return '轻薄玻璃，触点光与按压光柔和克制';
+      return '轻薄玻璃，触点光柔和';
     }
     if (this.glowLevel === GLOW_STRONG) {
-      return '厚重玻璃，触点光与按压光明亮突出';
+      return '厚重玻璃，触点光明亮';
     }
-    return '平衡的玻璃厚度与按压光（默认）';
+    return '平衡的玻璃厚度与触点光（默认）';
   }
 
-  // 官方按压光反馈（hdsEffect，来自华为 UIDesignKit，非应用自绘）：
-  // 平时柔和点光，按压时切高亮点光并叠加官方按压阴影；
-  // 强度按“沉浸光效强度”档位取参（柔和/标准/增强），数值只调系统光效的合法档。
-  private immersiveLight(pressed: boolean): VisualEffect {
-    let restColor: string = '#7DFFFFFF';
-    let restIntensity: number = 4;
-    let restBloom: number = 2;
-    let pressColor: string = '#E6FFFFFF';
-    let pressIntensity: number = 10;
-    let pressBloom: number = 5;
-    if (this.glowLevel === GLOW_SOFT) {
-      restColor = '#4DFFFFFF';
-      restIntensity = 2;
-      restBloom = 1;
-      pressColor = '#B3FFFFFF';
-      pressIntensity = 6;
-      pressBloom = 3;
-    } else if (this.glowLevel === GLOW_STRONG) {
-      restColor = '#B3FFFFFF';
-      restIntensity = 7;
-      restBloom = 4;
-      pressColor = '#FFFFFF';
-      pressIntensity = 16;
-      pressBloom = 9;
-    }
-    return new hdsEffect.HdsEffectBuilder()
-      .pressShadow(pressed ? hdsEffect.PressShadowType.BLEND_GRADIENT : hdsEffect.PressShadowType.NONE)
-      .pointLight({
-        sourceType: pressed ? hdsEffect.PointLightSourceType.BRIGHT : hdsEffect.PointLightSourceType.SOFT,
-        illuminatedType: hdsEffect.PointLightIlluminatedType.CONTENT,
-        options: {
-          color: pressed ? pressColor : restColor,
-          intensity: pressed ? pressIntensity : restIntensity,
-          height: 150,
-          bloom: pressed ? pressBloom : restBloom
-        }
-      })
-      .buildEffect();
+  // 悬浮领取按钮的玻璃观感：目标是与底部工具栏的官方材质外观保持一致——中性磨砂玻璃，不做额外着色
+  // （底栏材质未设 materialColor，即系统默认中性玻璃）。该按钮位于内容区、超出官方沉浸光感生效范围
+  // （官方仅对 Navigation/NavDestination 标题栏与底部 TabBar 开放，其它区域设置 systemMaterial 恒不生效，
+  // 日志：Material inactive: out of scope），故按官方建议用通用属性模拟。
+  private fabGlassColor(): string {
+    return this.pal().COLOR_CARD;
   }
 
-  // 悬浮领取按钮的系统材质：按“沉浸光效强度”档位给玻璃厚度/着色/触点光取参。
-  // 柔和=THIN 轻透、标准=REGULAR 出厂、增强=THICK 厚重（三档都是官方 ImmersiveStyle 枚举）。
-  private fabMaterial(): uiMaterial.ImmersiveMaterial {
-    if (this.glowLevel === GLOW_SOFT) {
-      return new uiMaterial.ImmersiveMaterial({
-        style: uiMaterial.ImmersiveStyle.THIN,
-        materialColor: '#660A59F7',
-        interactive: true,
-        lightEffect: { color: '#59FFFFFF' },
-        applyShadow: false
-      });
-    }
-    if (this.glowLevel === GLOW_STRONG) {
-      return new uiMaterial.ImmersiveMaterial({
-        style: uiMaterial.ImmersiveStyle.THICK,
-        materialColor: '#C40A59F7',
-        interactive: true,
-        lightEffect: { color: '#FFFFFF' },
-        applyShadow: false
-      });
-    }
-    return new uiMaterial.ImmersiveMaterial({
-      style: uiMaterial.ImmersiveStyle.REGULAR,
-      materialColor: '#8C0A59F7',
-      interactive: true,
-      lightEffect: { color: '#FFFFFF' },
-      applyShadow: false
-    });
+  // 悬浮按钮磨砂档位：与底部工具栏材质 style 一一对齐（柔和/标准=THIN、增强=REGULAR），观感保持一致。
+  private fabGlassBlur(): BlurStyle {
+    return this.glowLevel === GLOW_STRONG ? BlurStyle.Regular : BlurStyle.Thin;
   }
 
   // 底部悬浮 TabBar 的系统材质：标准=THIN 保持出厂通透观感，柔和再降触点光亮度，
@@ -1048,7 +1117,7 @@ struct Index {
       }
       this.calOn = true;
       saveCalOn(getContext(this) as common.Context, true);
-      promptAction.showToast({ message: '已开启：即将免费的游戏会自动加入系统日历' });
+      promptAction.showToast({ message: '已开启：按开领时刻写入日历，到点提醒' });
       // 若已拉到过“即将免费”，立刻补写一次并提示数量
       this.syncCalToCalendar(true);
     } else {
@@ -1129,7 +1198,8 @@ struct Index {
           .fontColor(this.pal().COLOR_ACCENT)
           .padding({ left: 12, right: 12, top: 8, bottom: 8 })
           .onClick(() => {
-            this.load();
+            // 手动触发：绕过失败冷却，立刻再试一次
+            this.load(true);
           })
       }
     }
@@ -1189,7 +1259,8 @@ struct Index {
     .translate({ y: this.entRise(0) })
     .animation(this.entAnim(0, 1))
     .onClick(() => {
-      this.load();
+      // 手动触发：绕过失败冷却，立刻再试一次
+      this.load(true);
     })
   }
 
@@ -1266,12 +1337,10 @@ struct Index {
       .padding({ left: 12, right: 12, top: 12, bottom: 12 })
     }
     .width('100%')
-    .backgroundColor(this.pal().COLOR_CARD)
-    .backgroundBlurStyle(BlurStyle.Thin)
+    .backgroundColor(this.pal().COLOR_CARD_SOLID)
     .border({ width: 1, color: this.pal().COLOR_HAIR })
     .borderRadius(16)
     .clip(true)
-    .visualEffect(this.immersiveLight(this.pressedKey === item.title))
     .onTouch((e: TouchEvent) => {
       if (e.type === TouchType.Down) {
         this.pressedKey = item.title;
@@ -1354,16 +1423,36 @@ struct Index {
 
   @Builder
   HistoryHeader() {
-    Column({ space: 3 }) {
-      Text('历史')
-        .fontSize(22)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(this.pal().COLOR_TEXT)
-      Text('EPIC 送过的免费游戏 · 共 ' + this.histList.length + ' 期')
+    Row() {
+      Column({ space: 3 }) {
+        Text('历史')
+          .fontSize(22)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.pal().COLOR_TEXT)
+        Text('EPIC 送过的免费游戏 · 共 ' + this.histList.length + ' 期' +
+          (this.ownedTitles.length > 0 ? ' · 已同步 ' + this.ownedTitles.length + ' 条' : ''))
+          .fontSize(12)
+          .fontColor(this.pal().COLOR_SUB)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      // 从登录的 EPIC 账号同步“已拥有”游戏：同步后历史里已入库的条目会显示“已领取”
+      Text('同步已拥有')
         .fontSize(12)
-        .fontColor(this.pal().COLOR_SUB)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.pal().COLOR_ACCENT)
+        .padding({ left: 12, right: 12, top: 7, bottom: 7 })
+        .backgroundColor(this.pal().COLOR_BADGE)
+        .borderRadius(15)
+        .margin({ left: 10 })
+        .onClick(() => {
+          this.pushSyncOwned();
+        })
     }
-    .alignItems(HorizontalAlign.Start)
+    .alignItems(VerticalAlign.Center)
     .width('100%')
     .padding({
       left: 16,
@@ -1435,12 +1524,10 @@ struct Index {
       .padding({ left: 12, right: 12, top: 12, bottom: 12 })
     }
     .width('100%')
-    .backgroundColor(this.pal().COLOR_CARD)
-    .backgroundBlurStyle(BlurStyle.Thin)
+    .backgroundColor(this.pal().COLOR_CARD_SOLID)
     .border({ width: 1, color: this.pal().COLOR_HAIR })
     .borderRadius(16)
     .clip(true)
-    .visualEffect(this.immersiveLight(this.pressedKey === h.t))
     .onTouch((e: TouchEvent) => {
       if (e.type === TouchType.Down) {
         this.pressedKey = h.t;
@@ -1462,21 +1549,40 @@ struct Index {
   @Builder
   HistoryView() {
     if (this.histList.length === 0) {
-      Column({ space: 10 }) {
-        Text('还没有历史记录')
-          .fontSize(16)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(this.pal().COLOR_TEXT)
-        Text('本应用检测到的每期免费游戏会自动记录在这里')
-          .fontSize(13)
-          .fontColor(this.pal().COLOR_SUB)
+      // 本地/缓存为空且正在后台补全名单：给“同步中”占位，不误报“还没有历史记录”
+      if (this.histFetching) {
+        Column({ space: 12 }) {
+          LoadingProgress()
+            .width(34)
+            .height(34)
+            .color(this.pal().COLOR_ACCENT)
+          Text('正在同步历史…')
+            .fontSize(13)
+            .fontColor(this.pal().COLOR_SUB)
+        }
+        .width('100%')
+        .padding({ top: 140, bottom: 140 })
+        .justifyContent(FlexAlign.Center)
+        .opacity(this.entOpacity(1))
+        .translate({ y: this.entRise(1) })
+        .animation(this.entAnim(1, 1))
+      } else {
+        Column({ space: 10 }) {
+          Text('还没有历史记录')
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.pal().COLOR_TEXT)
+          Text('本应用检测到的每期免费游戏会自动记录在这里')
+            .fontSize(13)
+            .fontColor(this.pal().COLOR_SUB)
+        }
+        .width('100%')
+        .padding({ top: 140, bottom: 140 })
+        .justifyContent(FlexAlign.Center)
+        .opacity(this.entOpacity(1))
+        .translate({ y: this.entRise(1) })
+        .animation(this.entAnim(1, 1))
       }
-      .width('100%')
-      .padding({ top: 140, bottom: 140 })
-      .justifyContent(FlexAlign.Center)
-      .opacity(this.entOpacity(1))
-      .translate({ y: this.entRise(1) })
-      .animation(this.entAnim(1, 1))
     } else {
       Scroll() {
         Column({ space: 12 }) {
@@ -1598,7 +1704,7 @@ struct Index {
     .animation({ duration: 160, curve: Curve.FastOutSlowIn })
   }
 
-  // “自动加入日历”开关行：把“即将免费”的开领日自动写成系统日历全天日程
+  // “自动加入日历”开关行：把“即将免费”按开领时刻写进系统日历，到点提醒
   @Builder
   CalRow() {
     Row() {
@@ -1607,7 +1713,7 @@ struct Index {
           .fontSize(16)
           .fontWeight(FontWeight.Medium)
           .fontColor(this.pal().COLOR_TEXT)
-        Text('把“即将免费”的开领日写为当天全天日程并提醒')
+        Text('按“即将免费”的开领时刻写日程，到点才提醒')
           .fontSize(12)
           .fontColor(this.pal().COLOR_SUB)
       }
@@ -1849,24 +1955,30 @@ struct Index {
           .width(NAV_PILL_W)
           .height(NAV_PILL_H)
           .borderRadius(NAV_PILL_H / 2)
-          // 选中高亮：系统蓝纯色块。进场=0.72→1 缩放淡入（轻“弹”），离场=纯淡出，
-          // 让高亮在页签间“换位”而非生硬闪变（跨格滑位已取消，内容翻页由页面层动效接管）
+          // 选中高亮：系统蓝纯色块。进场=0.86→1 缩放淡入（轻“弹”），离场=纯淡出，
+          // 让高亮在页签间“换位”而非生硬闪变（跨格滑位已取消，内容翻页由页面层动效接管）。
+          // 时长压到 120/100ms：高亮在按下那一刻立即换位，不再慢半拍。
           .backgroundColor(this.pal().COLOR_ACCENT)
           .transition(TransitionEffect.asymmetric(
-            TransitionEffect.OPACITY.animation({ duration: 220, curve: Curve.FastOutSlowIn })
-              .combine(TransitionEffect.scale({ x: 0.72, y: 0.72 })
-                .animation({ duration: 220, curve: Curve.FastOutSlowIn })),
-            TransitionEffect.OPACITY.animation({ duration: 150, curve: Curve.EaseIn })
+            TransitionEffect.OPACITY.animation({ duration: 120, curve: Curve.FastOutSlowIn })
+              .combine(TransitionEffect.scale({ x: 0.86, y: 0.86 })
+                .animation({ duration: 120, curve: Curve.FastOutSlowIn })),
+            TransitionEffect.OPACITY.animation({ duration: 100, curve: Curve.EaseIn })
           ))
       }
       Text(label)
         .fontSize(13)
         .fontWeight(this.curTab === index ? FontWeight.Medium : FontWeight.Normal)
         .fontColor(this.curTab === index ? '#FFFFFF' : this.pal().COLOR_SUB)
-        .animation({ duration: 220, curve: Curve.FastOutSlowIn })
+        .animation({ duration: 120, curve: Curve.FastOutSlowIn })
     }
     .width('100%')
     .height('100%')
+    // 关键：按下页签的瞬间就同步写 curTab（不等 Tabs 动画结束的 onChange），
+    // 让高亮与目标页内容立即起步；不拦截事件，Tabs 仍照常接管内容翻页。
+    .onClick(() => {
+      this.switchTab(index);
+    })
   }
 
   // ================= 背景与沉浸光感说明 =================
@@ -1928,7 +2040,7 @@ struct Index {
       })
   }
 
-  // “沉浸光效强度”分段行：柔和/标准/增强三档，切换即改系统材质与按压光的取参
+  // “沉浸光效强度”分段行：柔和/标准/增强三档，切换即改底栏与悬浮按钮系统材质（含触点光）的取参
   @Builder
   GlowRow() {
     Column({ space: 10 }) {
@@ -2037,7 +2149,7 @@ struct Index {
             .height('100%')
             .opacity(this.pageAlpha(0))
             .translate({ x: this.pageOffsetX(0) })
-            .animation({ duration: 300, curve: Curve.FastOutSlowIn })
+            .animation({ duration: 200, curve: Curve.FastOutSlowIn })
           }
           .tabBar(this.NavCell('游戏', 0))
 
@@ -2051,7 +2163,7 @@ struct Index {
             .height('100%')
             .opacity(this.pageAlpha(1))
             .translate({ x: this.pageOffsetX(1) })
-            .animation({ duration: 300, curve: Curve.FastOutSlowIn })
+            .animation({ duration: 200, curve: Curve.FastOutSlowIn })
           }
           .tabBar(this.NavCell('历史', 1))
 
@@ -2174,7 +2286,7 @@ struct Index {
             .height('100%')
             .opacity(this.pageAlpha(2))
             .translate({ x: this.pageOffsetX(2) })
-            .animation({ duration: 300, curve: Curve.FastOutSlowIn })
+            .animation({ duration: 200, curve: Curve.FastOutSlowIn })
           }
           .tabBar(this.NavCell('设置', 2))
         }
@@ -2185,7 +2297,8 @@ struct Index {
         .barOverlap(true)
         // 点页签/改 index 时由 Tabs 官方通道做内容横向滑切（BottomTabBar 默认 0 需显式开启）；
         // 页面层另有淡入+轻微错位动效叠加，方向一致、互为增强。
-        .animationDuration(300)
+        // 时长与页面层对齐（200ms）：两者同时收尾，按下即见效，不再有“滑完才出现”的等待感。
+        .animationDuration(200)
         .barFloatingStyle({
           // 收窄成居中悬浮胶囊宽；与旧几何一致
           barWidth: {
@@ -2218,10 +2331,11 @@ struct Index {
           .width(58)
           .height(58)
           .borderRadius(29)
-          // 官方沉浸式系统材质（API 26）：品牌蓝半透明玻璃 + 按压形变 + 白色触点光；
-          // 玻璃厚度/触点光亮度跟随“沉浸光效强度”档位（fabMaterial 取参）
-          .systemMaterial(this.fabMaterial())
-          // 中性环境投影：仅抬升悬浮层次，不含彩色辉光（光感由系统材质统一呈现）
+          // 与底部工具栏保持同一观感：中性磨砂玻璃（不额外着色），磨砂档位随“沉浸光效强度”对齐底栏材质。
+          // 该按钮位于内容区、超出官方沉浸光感生效范围，故用通用属性模拟（详见 fabGlassColor 注释）。
+          .backgroundColor(this.fabGlassColor())
+          .backgroundBlurStyle(this.fabGlassBlur())
+          .border({ width: 1, color: this.pal().COLOR_HAIR })
           .shadow({ radius: 18, color: '#40050A14', offsetY: 6 })
           .scale({ x: this.pressScale('__fab__'), y: this.pressScale('__fab__') })
           .animation({ duration: 160, curve: Curve.FastOutSlowIn })
